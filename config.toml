@@ -1,0 +1,11 @@
+[server]
+listen = ":8080"       # 监听地址
+
+[log]
+level = "info"          # 日志级别，debug, info, warn, error, fatal
+persistent = true       # 是否持久化日志文件
+path = "./log/latest.log" # 日志文件路径
+compression = true      # 是否压缩日志文件
+max_size = 50           # MB
+max_age = 7             # days
+max_backups = 3         # 最大备份文件数量
