@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/viper"
 	"github.com/zrurf/cifera/internal"
 	"github.com/zrurf/cifera/internal/addon"
+	"github.com/zrurf/cifera/internal/cache"
+	"github.com/zrurf/cifera/internal/compress"
 	"github.com/zrurf/cifera/internal/vhost"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -55,7 +57,36 @@ func main() {
 		}
 	}
 
-	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry)
+	// 初始化压缩协商器
+	var negotiator *compress.Negotiator
+	if config.Compression.Enabled {
+		compressCfg := config.Compression.ToCompressConfig()
+		negotiator = compress.NewNegotiator(compressCfg)
+		logger.Info("压缩模块已启用",
+			zap.Bool("gzip", config.Compression.Gzip.Enabled),
+			zap.Bool("brotli", config.Compression.Brotli.Enabled),
+			zap.Bool("zstd", config.Compression.Zstd.Enabled),
+		)
+	} else {
+		logger.Info("压缩模块已禁用")
+	}
+
+	// 初始化缓存
+	var cch *cache.Cache
+	if config.Cache.Enabled {
+		cch = cache.New(cache.Config{
+			Enabled: true,
+			MaxSize: config.Cache.MaxSize,
+		}, logger)
+		maxSizeMB := config.Cache.MaxSize / (1024 * 1024)
+		logger.Info("缓存模块已启用",
+			zap.Int64("max_size_mb", maxSizeMB),
+		)
+	} else {
+		logger.Info("缓存模块已禁用")
+	}
+
+	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch)
 	http.Handle("/", handler)
 
 	logger.Info("服务启动", zap.String("listen", config.Server.Listen))
@@ -131,6 +162,19 @@ func setDefaults(v *viper.Viper) {
 
 	// Addons 默认值
 	v.SetDefault("addons.dir", "./addons")
+
+	// Compression 默认值
+	v.SetDefault("compression.enabled", true)
+	v.SetDefault("compression.gzip.enabled", true)
+	v.SetDefault("compression.gzip.level", 5)
+	v.SetDefault("compression.brotli.enabled", true)
+	v.SetDefault("compression.brotli.level", 4)
+	v.SetDefault("compression.zstd.enabled", true)
+	v.SetDefault("compression.zstd.level", 3)
+
+	// Cache 默认值
+	v.SetDefault("cache.enabled", true)
+	v.SetDefault("cache.max_size", 256*1024*1024) // 256MB
 }
 
 // initLog 根据配置初始化日志系统，返回配置完成后的 logger

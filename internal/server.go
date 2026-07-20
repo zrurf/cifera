@@ -10,8 +10,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/zrurf/cifera/internal/addon"
+	"github.com/zrurf/cifera/internal/cache"
+	"github.com/zrurf/cifera/internal/compress"
 	"github.com/zrurf/cifera/internal/constant"
 	"github.com/zrurf/cifera/internal/rewriter"
 	"github.com/zrurf/cifera/internal/utils"
@@ -45,18 +49,53 @@ func isRedirect(statusCode int) bool {
 		statusCode == http.StatusPermanentRedirect
 }
 
+// newOptimizedTransport 创建优化后的 HTTP Transport
+func newOptimizedTransport() *http.Transport {
+	return &http.Transport{
+		// 连接池优化：大幅增加每主机空闲连接数
+		MaxIdleConns:        500,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     0, // 不限制每主机活跃连接数
+
+		// 超时设置
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+
+		// 启用 HTTP/2
+		ForceAttemptHTTP2: true,
+
+		// 禁用自动解压：由我们在 ModifyResponse 中处理
+		// 这样非 HTML 响应可以透传上游压缩，避免解压-再压缩的开销
+		DisableCompression: true,
+
+		// 缓冲优化
+		WriteBufferSize: 256 * 1024, // 256KB 写缓冲
+		ReadBufferSize:  256 * 1024, // 256KB 读缓冲
+	}
+}
+
 // CreateServer 创建代理服务器
 // addons: 已加载的 addon 列表
 // registry: 虚拟主机注册表
-func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry) http.Handler {
+// negotiator: 压缩协商器（可为 nil 表示不压缩）
+// cch: 缓存实例（可为 nil 表示不缓存）
+func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache) http.Handler {
 	h := &ciferaHandler{
-		addons:    addons,
-		registry:  registry,
-		runtimeJS: runtimeJS,
-		logger:    logger,
+		addons:     addons,
+		registry:   registry,
+		runtimeJS:  runtimeJS,
+		logger:     logger,
+		negotiator: negotiator,
+		cache:      cch,
+		sem:        make(chan struct{}, 4096), // 最多 4096 个并发代理请求
 	}
 
+	transport := newOptimizedTransport()
+
 	proxy := &httputil.ReverseProxy{
+		Transport: transport,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			params, ok := r.In.Context().Value(proxyParamsKey).(*proxyParams)
 			if !ok {
@@ -103,8 +142,10 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 				}
 			}
 
-			// 删除 Accept-Encoding，让上游返回未压缩的 HTML，便于改写
-			r.Out.Header.Del("Accept-Encoding")
+			// 转发客户端 Accept-Encoding 给上游
+			// 配合 DisableCompression: true，上游可能返回压缩响应
+			// 非 HTML 压缩响应可透传给客户端，HTML 则需解压后改写再压缩
+			// 不再无条件删除 Accept-Encoding
 
 			// 将代理参数存入 context，供 ModifyResponse 使用
 			r.Out = r.Out.WithContext(context.WithValue(r.Out.Context(), proxyParamsKey, params))
@@ -159,11 +200,17 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 
 // ciferaHandler 整合 addon block 检查、虚拟主机分发和响应处理的 handler
 type ciferaHandler struct {
-	proxy     http.Handler
-	addons    []*addon.LoadedAddon
-	registry  *vhost.Registry
-	runtimeJS string
-	logger    *zap.Logger
+	proxy      http.Handler
+	addons     []*addon.LoadedAddon
+	registry   *vhost.Registry
+	runtimeJS  string
+	logger     *zap.Logger
+	negotiator *compress.Negotiator
+	cache      *cache.Cache
+	// 并发控制信号量，限制同时处理的代理请求数
+	sem chan struct{}
+	// addon 规则匹配结果缓存（正则匹配开销大，短生命周期缓存减少重复计算）
+	addonMatchCache sync.Map
 }
 
 // ServeHTTP 处理所有进入的请求
@@ -207,8 +254,35 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 缓存查找：仅对 GET/HEAD 请求检查缓存
+	if h.cache != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		cacheKey := cache.BuildCacheKey(params.schema, params.host, r.URL.RequestURI())
+		if cachedResp, ok := h.cache.Get(cacheKey); ok {
+			h.logger.Debug("缓存命中",
+				zap.String("key", cacheKey),
+			)
+			// 写回缓存的响应
+			writeResponse(w, cachedResp)
+			return
+		}
+	}
+
 	// 将 params 存入 context，供 Rewrite 使用
 	ctx = context.WithValue(ctx, proxyParamsKey, params)
+
+	// 并发控制：获取信号量
+	select {
+	case h.sem <- struct{}{}:
+		defer func() { <-h.sem }()
+	default:
+		// 信号量已满，返回 503
+		h.logger.Warn("并发请求超过限制，返回 503",
+			zap.String("path", r.URL.Path),
+		)
+		http.Error(w, "Too many concurrent requests", http.StatusServiceUnavailable)
+		return
+	}
+
 	h.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
@@ -238,11 +312,20 @@ func (h *ciferaHandler) serveOverride(w http.ResponseWriter, r *http.Request, vh
 		// 即使处理失败也尝试写回响应
 	}
 
+	// 压缩响应（override vhost 路径也需要压缩）
+	if h.negotiator != nil {
+		if err := h.negotiator.CompressResponse(resp, r); err != nil {
+			h.logger.Debug("压缩响应失败，使用未压缩响应",
+				zap.Error(err),
+			)
+		}
+	}
+
 	// 写回客户端
 	writeResponse(w, resp)
 }
 
-// processResponse 处理响应：addon replace → redirect → cookie → inject → HTML rewrite
+// processResponse 处理响应：addon replace → redirect → cookie → inject → HTML rewrite → cache → compress
 func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams) error {
 	// 构造原始 URL 用于 addon 匹配
 	originalURL := buildOriginalURL(params.schema, params.host, resp.Request.URL)
@@ -299,17 +382,101 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 	// 匹配 addon inject 规则
 	injectItems := addon.MatchInject(h.addons, originalURL)
 
-	// 处理 HTML 响应 body 改写
-	proxyBase := params.entryScheme + "://" + params.proxy
-	if err := rewriter.RewriteResponse(resp, h.runtimeJS, proxyBase, params.currentPath, params.host, params.schema, params.referer, params.pageOrigin, injectItems, h.logger); err != nil {
-		h.logger.Error("改写 HTML 响应失败",
+	// 检测 Content-Type 是否为 HTML
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	isHTML := strings.Contains(contentType, "text/html")
+
+	// 处理上游压缩的 HTML：需要解压后才能改写
+	contentEncoding := resp.Header.Get("Content-Encoding")
+	if isHTML && contentEncoding != "" {
+		if err := decompressResponseBody(resp, contentEncoding); err != nil {
+			h.logger.Error("解压上游 HTML 响应失败",
+				zap.String("host", params.host),
+				zap.String("path", params.currentPath),
+				zap.String("encoding", contentEncoding),
+				zap.Error(err),
+			)
+			return err
+		}
+	}
+
+	// 非 HTML 且上游已压缩：透传压缩响应（无需解压和改写）
+	// 直接跳过 HTML 改写和代理层压缩
+	if !isHTML && contentEncoding != "" {
+		h.logger.Debug("透传上游压缩响应",
 			zap.String("host", params.host),
 			zap.String("path", params.currentPath),
-			zap.Error(err),
+			zap.String("encoding", contentEncoding),
 		)
+		// 缓存：不缓存已压缩响应（不同客户端支持不同算法，缓存统一未压缩版本更灵活）
+		return nil
+	}
+
+	// 处理 HTML 响应 body 改写
+	proxyBase := params.entryScheme + "://" + params.proxy
+	if isHTML {
+		if err := rewriter.RewriteResponse(resp, h.runtimeJS, proxyBase, params.currentPath, params.host, params.schema, params.referer, params.pageOrigin, injectItems, h.logger); err != nil {
+			h.logger.Error("改写 HTML 响应失败",
+				zap.String("host", params.host),
+				zap.String("path", params.currentPath),
+				zap.Error(err),
+			)
+			return err
+		}
+	}
+
+	// 缓存：异步存储非 HTML、可缓存的响应（压缩前缓存，确保缓存通用性）
+	if h.cache != nil && !isHTML {
+		req := resp.Request
+		if req != nil && cache.IsCacheable(resp, req) {
+			// 读取 body 用于缓存
+			body, err := io.ReadAll(resp.Body)
+			if err == nil {
+				cacheKey := cache.BuildCacheKey(params.schema, params.host, req.URL.RequestURI())
+				// 异步写入缓存，不阻塞响应
+				h.cache.SetAsync(cacheKey, resp.Header, body, resp.StatusCode)
+				h.logger.Debug("缓存异步存储",
+					zap.String("key", cacheKey),
+					zap.Int("size", len(body)),
+				)
+				// 重置 body 供后续压缩和写入
+				resp.Body = io.NopCloser(bytes.NewReader(body))
+			}
+		}
+	}
+
+	// 压缩响应（非透传的情况下才压缩）
+	if h.negotiator != nil {
+		origReq := resp.Request
+		if origReq != nil {
+			if err := h.negotiator.CompressResponse(resp, origReq); err != nil {
+				h.logger.Debug("压缩响应失败，使用未压缩响应",
+					zap.Error(err),
+				)
+			}
+		}
+	}
+
+	return nil
+}
+
+// decompressResponseBody 解压上游压缩的响应体
+func decompressResponseBody(resp *http.Response, encoding string) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	decoded, err := compress.Decode(body, encoding)
+	if err != nil {
 		return err
 	}
 
+	resp.Body = io.NopCloser(bytes.NewReader(decoded))
+	resp.ContentLength = int64(len(decoded))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(decoded)))
+	resp.Header.Del("Content-Encoding")
 	return nil
 }
 

@@ -4,10 +4,25 @@ import (
 	"bytes"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/zrurf/cifera/internal/utils"
 	"golang.org/x/net/html"
 )
+
+// attrRegexCache 缓存已编译的属性匹配正则，避免每次请求重新编译
+var attrRegexCache sync.Map
+
+// getAttrRegex 获取或编译属性名对应的正则
+func getAttrRegex(attrName string) *regexp.Regexp {
+	if v, ok := attrRegexCache.Load(attrName); ok {
+		return v.(*regexp.Regexp)
+	}
+	pattern := `(?i)(\b` + regexp.QuoteMeta(attrName) + `\s*=\s*)(?:"([^"]*)"|'([^']*)')`
+	re := regexp.MustCompile(pattern)
+	actual, _ := attrRegexCache.LoadOrStore(attrName, re)
+	return actual.(*regexp.Regexp)
+}
 
 // reCSSURL 用于改写 CSS 中的 url()
 var reCSSURL = regexp.MustCompile(`url\(\s*['"]?([^'"\)\s]+)['"]?\s*\)`)
@@ -65,7 +80,8 @@ var tagSpecificURLAttrs = map[string]map[string]bool{
 func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema, referer string) []byte {
 	r := bytes.NewReader(htmlBytes)
 	tokenizer := html.NewTokenizer(r)
-	var buf bytes.Buffer
+	// 预分配缓冲区：HTML 改写后通常比原始大 20-50%（因代理参数追加）
+	buf := bytes.NewBuffer(make([]byte, 0, len(htmlBytes)+len(htmlBytes)/2))
 
 	// 跟踪当前是否在 <style> 标签内
 	inStyle := false
@@ -290,9 +306,8 @@ func htmlEntityReplacer(val string) string {
 var reAttrValue = regexp.MustCompile(`(\bATTR\s*=\s*)(?:"([^"]*)"|'([^']*)')`)
 
 func replaceAttrValueInRaw(raw, attrName, newVal string) string {
-	// 构建匹配指定属性名的正则
-	pattern := `(?i)(\b` + regexp.QuoteMeta(attrName) + `\s*=\s*)(?:"([^"]*)"|'([^']*)')`
-	re := regexp.MustCompile(pattern)
+	// 使用缓存的正则，避免每次请求编译
+	re := getAttrRegex(attrName)
 
 	return re.ReplaceAllStringFunc(raw, func(match string) string {
 		submatches := re.FindStringSubmatch(match)

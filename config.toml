@@ -14,6 +14,27 @@ max_backups = 3             # 最大备份文件数量
 dir = "./addons"            # addon 加载目录
 # enabled = []              # 仅加载指定 addon（按 id），若缺省或为空则加载全部
 
+## 压缩配置
+[compression]
+enabled = true              # 是否启用响应压缩
+
+[compression.gzip]
+enabled = true              # 是否启用 gzip
+level = 5                   # 压缩级别 (1-9)
+
+[compression.brotli]
+enabled = true              # 是否启用 brotli
+level = 4                   # 压缩级别 (0-11)
+
+[compression.zstd]
+enabled = true              # 是否启用 zstd
+level = 4                   # 压缩级别 (1-22)
+
+## 缓存配置
+[cache]
+enabled = true              # 是否启用代理层缓存
+max_size = 268435456        # 最大缓存大小（字节），默认 256MB
+
 ## 虚拟主机配置
 # [[hosts]]
 # name = "0"                # 虚拟主机名称（host）
