@@ -40,22 +40,57 @@ function shouldSkip(url: string): boolean {
 
 /**
  * 代理 host 归一化
- * 检测 URL host 是否为代理 host 或其子域拼接（如业务代码 'api.' + window.location.host）
- * 若是，将代理 host 部分替换为源站 host（PROXY_HOST），保留子域前缀
+ * 检测 URL host 是否存在以下问题并修复：
+ *  1. host 为代理 host 或其子域拼接（如业务代码 'api.' + window.location.host）
+ *     → 将代理 host 部分替换为源站 host（PROXY_HOST），保留子域前缀
+ *  2. host 为源站 host 或其子域，但被错误拼接了代理端口（如 'cn.bing.com:' + window.location.port）
+ *     → 剥离错误的代理端口
  *
  * 示例（代理 host=127.0.0.1:8080, 源站 host=example.com）：
- *   127.0.0.1:8080     → example.com
- *   127.0.0.1          → example.com
- *   api.127.0.0.1:8080 → api.example.com
- *   api.127.0.0.1      → api.example.com
- *   other.com          → other.com（不匹配，原样返回）
+ *   127.0.0.1:8080         → example.com            （代理 host 本身）
+ *   127.0.0.1              → example.com            （代理 hostname）
+ *   api.127.0.0.1:8080     → api.example.com        （代理 host 子域）
+ *   api.127.0.0.1          → api.example.com        （代理 hostname 子域）
+ *   example.com:8080       → example.com            （源站 host + 代理端口）
+ *   sub.example.com:8080   → sub.example.com        （源站子域 + 代理端口）
+ *   other.com              → other.com              （不匹配，原样返回）
  */
 function normalizeProxyHost(host: string): string {
     if (!host || !PROXY_HOST) return host;
 
     const proxyHost = window.location.host;       // 如 "127.0.0.1:8080"
     const proxyHostname = window.location.hostname; // 如 "127.0.0.1"
+    const proxyPort = window.location.port;        // 如 "8080"
 
+    // 提取源站 hostname（PROXY_HOST 可能含端口，如 "example.com:443"）
+    let originHostname = PROXY_HOST;
+    try {
+        originHostname = new URL('http://' + PROXY_HOST).hostname;
+    } catch {
+        // 解析失败，保持原值
+    }
+
+    // 步骤 1：检测并剥离错误拼接的 proxy port
+    // 页面 JS 可能将 window.location.port 拼接到源站 host 或代理 host 上
+    if (proxyPort && host.endsWith(':' + proxyPort)) {
+        const hostname = host.slice(0, host.length - proxyPort.length - 1);
+
+        // hostname 是源站 hostname 本身 → 返回 PROXY_HOST（保留源站端口）
+        if (hostname === originHostname) {
+            return PROXY_HOST;
+        }
+        // hostname 是源站 hostname 的子域 → 返回 hostname（去掉错误端口）
+        if (originHostname && hostname.endsWith('.' + originHostname)) {
+            return hostname;
+        }
+        // hostname 是代理 host 相关 → 去掉端口，继续后续代理 host 检测
+        if (hostname === proxyHost || hostname === proxyHostname ||
+            hostname.endsWith('.' + proxyHost) || hostname.endsWith('.' + proxyHostname)) {
+            host = hostname;
+        }
+    }
+
+    // 步骤 2：代理 host 检测（原有逻辑）
     // 完全匹配代理 host（含端口）或代理 hostname（不含端口）
     if (host === proxyHost || host === proxyHostname) {
         return PROXY_HOST;

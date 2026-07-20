@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/zrurf/cifera/internal/addon"
 	"github.com/zrurf/cifera/internal/constant"
@@ -48,10 +50,10 @@ func isRedirect(statusCode int) bool {
 // registry: 虚拟主机注册表
 func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry) http.Handler {
 	h := &ciferaHandler{
-		addons:   addons,
-		registry: registry,
+		addons:    addons,
+		registry:  registry,
 		runtimeJS: runtimeJS,
-		logger:   logger,
+		logger:    logger,
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -343,6 +345,13 @@ func parseProxyParams(r *http.Request, logger *zap.Logger) *proxyParams {
 		}
 	}
 
+	// 剥离源站 host 中意外携带的代理端口
+	// 前端 JS 可能将 window.location.port（代理端口）拼接到源站 host 上，
+	// 产生如 "cn.bing.com:8080" 的错误 host（源站实际不在 8080 端口）。
+	// 检测逻辑：host 末尾的端口等于代理端口，且 host 去掉端口后的部分
+	// 不是代理 hostname（避免误剥离代理 host 本身的端口）
+	host = stripProxyPort(host, r.Host, logger)
+
 	// schema 默认值
 	if schema == "" {
 		schema = "http"
@@ -390,15 +399,15 @@ func parseProxyParams(r *http.Request, logger *zap.Logger) *proxyParams {
 func writeResponse(w http.ResponseWriter, resp *http.Response) {
 	// 复制 Header（跳过 hop-by-hop 头）
 	hopByHop := map[string]bool{
-		"Connection":        true,
-		"Proxy-Connection":  true,
-		"Keep-Alive":        true,
-		"Proxy-Authenticate": true,
+		"Connection":          true,
+		"Proxy-Connection":    true,
+		"Keep-Alive":          true,
+		"Proxy-Authenticate":  true,
 		"Proxy-Authorization": true,
-		"Te":                true,
-		"Trailer":           true,
-		"Transfer-Encoding": true,
-		"Upgrade":           true,
+		"Te":                  true,
+		"Trailer":             true,
+		"Transfer-Encoding":   true,
+		"Upgrade":             true,
 	}
 
 	for key, vals := range resp.Header {
@@ -432,6 +441,68 @@ func buildOriginalURL(schema, host string, reqURL *url.URL) string {
 	q.Del(constant.ProxyRefererPrefix)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// stripProxyPort 剥离源站 host 中意外携带的代理端口
+// 场景：前端 JS 将 window.location.port（代理端口）拼接到源站 host 上，
+// 产生如 "cn.bing.com:8080" 的错误 host。
+//
+// 参数：
+//   - host: 从 _cifera_h 参数提取的目标 host
+//   - requestHost: 请求的 r.Host，即代理入口地址（如 "127.0.0.1:8080"）
+//
+// 逻辑：
+//  1. 从 requestHost 中提取代理端口
+//  2. 如果 host 以 ":proxyPort" 结尾，且去掉端口后的 hostname 不是代理 hostname，
+//     则剥离端口（该端口是代理端口而非源站端口）
+//  3. 如果 hostname 是代理 hostname 本身，保留端口（代理 host 本身就需要带端口）
+func stripProxyPort(host, requestHost string, logger *zap.Logger) string {
+	if host == "" || requestHost == "" {
+		return host
+	}
+
+	// 从代理入口地址提取 hostname 和 port
+	var proxyHostname, proxyPort string
+	if h, p, err := net.SplitHostPort(requestHost); err == nil {
+		proxyHostname = h
+		proxyPort = p
+	} else {
+		// requestHost 不含端口（如 "127.0.0.1"），无需处理
+		return host
+	}
+
+	if proxyPort == "" {
+		return host
+	}
+
+	// 检查 host 是否以 ":proxyPort" 结尾
+	hostHostname, hostPort, err := net.SplitHostPort(host)
+	if err != nil {
+		// host 不含端口，无需处理
+		return host
+	}
+
+	if hostPort != proxyPort {
+		// host 的端口不等于代理端口，可能是源站的合法端口，保留
+		return host
+	}
+
+	// host 的端口等于代理端口：
+	// - 如果 hostHostname 是代理 hostname → 保留（代理 host 本身需要带端口）
+	// - 如果 hostHostname 是代理 hostname 的子域 → 保留（子域代理场景也需要端口）
+	// - 其他情况 → 剥离端口（源站 host 被意外拼接了代理端口）
+	if hostHostname == proxyHostname || strings.HasSuffix(hostHostname, "."+proxyHostname) {
+		// 代理 host 相关，保留端口
+		return host
+	}
+
+	logger.Debug("剥离源站 host 中意外携带的代理端口",
+		zap.String("original_host", host),
+		zap.String("stripped_host", hostHostname),
+		zap.String("proxy_port", proxyPort),
+	)
+
+	return hostHostname
 }
 
 // readCloser 包装 io.Reader 为 io.ReadCloser
