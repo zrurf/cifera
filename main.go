@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/zrurf/cifera/internal"
+	"github.com/zrurf/cifera/internal/addon"
+	"github.com/zrurf/cifera/internal/vhost"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -33,7 +35,27 @@ func main() {
 	logger = initLog(logger, config.Log)
 	defer logger.Sync()
 
-	handler := internal.CreateServer(logger, ciferaRuntimeJS)
+	// 加载 addon
+	addons, err := addon.LoadAddons(config.Addons.Dir, config.Addons.Enabled, logger)
+	if err != nil {
+		logger.Fatal("加载 addon 失败", zap.Error(err))
+	}
+
+	// 初始化虚拟主机注册表
+	registry := vhost.NewRegistry(logger)
+	if err := registry.LoadFromConfig(config.Hosts); err != nil {
+		logger.Fatal("加载 config 虚拟主机失败", zap.Error(err))
+	}
+	for _, a := range addons {
+		if err := registry.LoadFromAddonHosts(a.Manifest.Hosts, a.Dir, a.Manifest.Addon.ID); err != nil {
+			logger.Error("加载 addon 虚拟主机失败",
+				zap.String("addon", a.Manifest.Addon.ID),
+				zap.Error(err),
+			)
+		}
+	}
+
+	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry)
 	http.Handle("/", handler)
 
 	logger.Info("服务启动", zap.String("listen", config.Server.Listen))
@@ -106,6 +128,9 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("log.max_backups", 3)
 	v.SetDefault("log.max_age", 7) // days
 	v.SetDefault("log.compression", true)
+
+	// Addons 默认值
+	v.SetDefault("addons.dir", "./addons")
 }
 
 // initLog 根据配置初始化日志系统，返回配置完成后的 logger

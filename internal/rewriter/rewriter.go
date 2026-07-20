@@ -7,12 +7,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zrurf/cifera/internal/addon"
 	"go.uber.org/zap"
 )
 
 // RewriteResponse 检测并改写 HTML 响应
 // 如果响应是 text/html 且内容包含实际 HTML 结构，则改写静态 URL 并注入 JS 运行时
-func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, pageOrigin string, logger *zap.Logger) error {
+// addonInjects: addon 的 inject 列表，将在运行时 JS 之后注入到 HTML 中
+func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, pageOrigin string, addonInjects []addon.InjectItem, logger *zap.Logger) error {
 	// 检测 Content-Type 是否为 HTML
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if !strings.Contains(contentType, "text/html") {
@@ -54,6 +56,11 @@ func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, hos
 
 	// 注入 JS 运行时（pageOrigin 作为 __CIFERA__.p 传递给 JS 运行时）
 	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, pageOrigin)
+
+	// 注入 addon 的 JS/CSS
+	if len(addonInjects) > 0 {
+		rewritten = addon.InjectAddons(rewritten, addonInjects)
+	}
 
 	// 设置新 body
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))

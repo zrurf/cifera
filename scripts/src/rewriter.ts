@@ -39,6 +39,46 @@ function shouldSkip(url: string): boolean {
 }
 
 /**
+ * 代理 host 归一化
+ * 检测 URL host 是否为代理 host 或其子域拼接（如业务代码 'api.' + window.location.host）
+ * 若是，将代理 host 部分替换为源站 host（PROXY_HOST），保留子域前缀
+ *
+ * 示例（代理 host=127.0.0.1:8080, 源站 host=example.com）：
+ *   127.0.0.1:8080     → example.com
+ *   127.0.0.1          → example.com
+ *   api.127.0.0.1:8080 → api.example.com
+ *   api.127.0.0.1      → api.example.com
+ *   other.com          → other.com（不匹配，原样返回）
+ */
+function normalizeProxyHost(host: string): string {
+    if (!host || !PROXY_HOST) return host;
+
+    const proxyHost = window.location.host;       // 如 "127.0.0.1:8080"
+    const proxyHostname = window.location.hostname; // 如 "127.0.0.1"
+
+    // 完全匹配代理 host（含端口）或代理 hostname（不含端口）
+    if (host === proxyHost || host === proxyHostname) {
+        return PROXY_HOST;
+    }
+
+    // 子域拼接：以 ".<proxyHost>" 结尾（如 "api.127.0.0.1:8080"）
+    const dotProxyHost = '.' + proxyHost;
+    if (host.endsWith(dotProxyHost)) {
+        const prefix = host.slice(0, host.length - dotProxyHost.length);
+        return prefix + '.' + PROXY_HOST;
+    }
+
+    // 子域拼接：以 ".<proxyHostname>" 结尾（如 "api.127.0.0.1"）
+    const dotProxyHostname = '.' + proxyHostname;
+    if (host.endsWith(dotProxyHostname)) {
+        const prefix = host.slice(0, host.length - dotProxyHostname.length);
+        return prefix + '.' + PROXY_HOST;
+    }
+
+    return host;
+}
+
+/**
  * 将 URL 改写为代理 URL
  * @param url 原始 URL
  * @param baseUrl 可选的基础 URL，用于解析相对路径
@@ -56,6 +96,14 @@ export function rewriteUrl(url: string, baseUrl?: string): string {
         } catch {
             // 如果解析失败，保持原样
             return url;
+        }
+
+        // 修复代理 host 子域拼接：将代理 host 部分替换为源站 host
+        // 业务代码可能执行 'api.' + window.location.host 得到 'api.127.0.0.1:8080'
+        // 此处将其归一化为 'api.<源站host>'，避免错误代理
+        const adjustedHost = normalizeProxyHost(parsed.host);
+        if (adjustedHost !== parsed.host) {
+            parsed.host = adjustedHost;
         }
 
         // 判断是否为同源请求（目标 host 与当前页面 host 相同）

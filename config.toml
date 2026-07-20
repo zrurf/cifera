@@ -1,11 +1,24 @@
 [server]
-listen = ":8080"       # 监听地址
+listen = ":8080"            # 监听地址
 
 [log]
-level = "info"          # 日志级别，debug, info, warn, error, fatal
-persistent = true       # 是否持久化日志文件
-path = "./log/latest.log" # 日志文件路径
-compression = true      # 是否压缩日志文件
-max_size = 50           # MB
-max_age = 7             # days
-max_backups = 3         # 最大备份文件数量
+level = "info"              # 日志级别，debug, info, warn, error, fatal
+persistent = true           # 是否持久化日志文件
+path = "./log/latest.log"   # 日志文件路径
+compression = true          # 是否压缩日志文件
+max_size = 50               # MB
+max_age = 7                 # days
+max_backups = 3             # 最大备份文件数量
+
+[addons]
+dir = "./addons"            # addon 加载目录
+# enabled = []              # 仅加载指定 addon（按 id），若缺省或为空则加载全部
+
+## 虚拟主机配置
+# [[hosts]]
+# name = "0"                # 虚拟主机名称（host）
+# type = "local"            # 虚拟主机类型，local 或 remote
+# remote = "https://example.com"    # 远程虚拟主机地址（type 为 remote 时必填）
+# path = "./vhost/0/"       # 本地虚拟主机路径（type 为 local 时必填）
+# priority = "override"     # 优先级，override 或 fallback
+# fallback_status = "4..|5.."       # 回退状态码，正则匹配（fallback 时必填）

@@ -31,7 +31,7 @@ func InjectRuntime(html []byte, jsContent, host, schema, referer, pageOrigin str
 	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {
-		configJSON = []byte(fmt.Sprintf(`{"h":"%s","s":"%s"}`, host, schema))
+		configJSON = fmt.Appendf(nil, `{"h":"%s","s":"%s"}`, host, schema)
 	}
 
 	// 构造注入片段
