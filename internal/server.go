@@ -270,16 +270,17 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 将 params 存入 context，供 Rewrite 使用
 	ctx = context.WithValue(ctx, proxyParamsKey, params)
 
-	// 并发控制：获取信号量
+	// 并发控制：获取信号量，排队等待而非直接拒绝
+	// 当并发数达到上限时，请求会阻塞等待槽位释放，而非返回 503
+	// 若客户端在等待期间断开连接，通过 context 取消避免 goroutine 泄漏
 	select {
 	case h.sem <- struct{}{}:
 		defer func() { <-h.sem }()
-	default:
-		// 信号量已满，返回 503
-		h.logger.Warn("并发请求超过限制，返回 503",
+	case <-ctx.Done():
+		h.logger.Debug("等待并发槽位时客户端断开",
 			zap.String("path", r.URL.Path),
+			zap.Error(ctx.Err()),
 		)
-		http.Error(w, "Too many concurrent requests", http.StatusServiceUnavailable)
 		return
 	}
 
