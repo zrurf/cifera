@@ -17,6 +17,7 @@ import (
 	"github.com/zrurf/cifera/internal/cache"
 	"github.com/zrurf/cifera/internal/compress"
 	"github.com/zrurf/cifera/internal/constant"
+	"github.com/zrurf/cifera/internal/cookiejar"
 	"github.com/zrurf/cifera/internal/rewriter"
 	"github.com/zrurf/cifera/internal/utils"
 	"github.com/zrurf/cifera/internal/vhost"
@@ -29,16 +30,19 @@ type proxyParams struct {
 	host        string // 目标服务器的 host
 	proxy       string // 代理入口地址，如 "127.0.0.1:8080"
 	entryScheme string // 代理入口自身的 scheme（http/https）
-	referer     string // 当前请求的来源页（用于 Referer 头）
-	pageOrigin  string // 当前资源的原始 URL（用于 _cifera_r，即子资源的来源标识）
+	referer     string // 当前请求的来源页（从 Cifera-Referer 头获取，用于转发给源站的 Referer 头）
 	currentPath string // 当前请求的路径（用于相对 URL 解析）
 }
 
 type ctxKey string
 
 const (
-	proxyParamsKey   ctxKey = "proxy_params"
-	fallbackVhostKey ctxKey = "fallback_vhost"
+	proxyParamsKey      ctxKey = "proxy_params"
+	fallbackVhostKey    ctxKey = "fallback_vhost"
+	cookieJarKey        ctxKey = "cookie_jar"
+	cookieSessionIDKey  ctxKey = "cookie_session_id"
+	cookieSessionNewKey ctxKey = "cookie_session_new"
+	cookieSyncKeysKey   ctxKey = "cookie_sync_keys"
 )
 
 // isRedirect 判断响应是否为重定向
@@ -81,7 +85,8 @@ func newOptimizedTransport() *http.Transport {
 // registry: 虚拟主机注册表
 // negotiator: 压缩协商器（可为 nil 表示不压缩）
 // cch: 缓存实例（可为 nil 表示不缓存）
-func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache) http.Handler {
+// cookieMgr: Cookie Jar 管理器（可为 nil 表示不启用）
+func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache, cookieMgr *cookiejar.Manager) http.Handler {
 	h := &ciferaHandler{
 		addons:     addons,
 		registry:   registry,
@@ -89,6 +94,7 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 		logger:     logger,
 		negotiator: negotiator,
 		cache:      cch,
+		cookieMgr:  cookieMgr,
 		sem:        make(chan struct{}, 4096), // 最多 4096 个并发代理请求
 	}
 
@@ -119,11 +125,9 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 				Path:    r.In.URL.Path,
 				RawPath: r.In.URL.RawPath,
 			}
-			// 复制查询参数，移除代理参数
+			// 复制查询参数，移除所有 _cifera_* 代理参数
 			q := r.In.URL.Query()
-			q.Del(constant.ProxyHostPrefix)
-			q.Del(constant.ProxySchemaPrefix)
-			q.Del(constant.ProxyRefererPrefix)
+			utils.StripMetaParams(q)
 			outURL.RawQuery = q.Encode()
 
 			r.Out.URL = outURL
@@ -131,6 +135,15 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 			r.Out.URL.Host = params.host
 			r.Out.Host = params.host
 			r.Out.Header.Set("Referer", params.referer)
+
+			// 移除所有 Cifera-* 头，避免泄漏到源服务器
+			utils.StripMetaHeaders(r.Out.Header)
+
+			// 移除 _cifera_sid cookie，确保不会转发到源服务器
+			// （Cookie Jar 模式下 Cookie 头已被替换为 jar 中的 cookie，但做双重保护）
+			if cookieHeader := r.Out.Header.Get("Cookie"); cookieHeader != "" {
+				r.Out.Header.Set("Cookie", stripSessionCookie(cookieHeader))
+			}
 
 			// 重写 Origin 头：将代理域名替换为目标站点域名
 			// 部分站点校验 Origin，必须使用目标站点的域名
@@ -147,8 +160,23 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 			// 非 HTML 压缩响应可透传给客户端，HTML 则需解压后改写再压缩
 			// 不再无条件删除 Accept-Encoding
 
-			// 将代理参数存入 context，供 ModifyResponse 使用
-			r.Out = r.Out.WithContext(context.WithValue(r.Out.Context(), proxyParamsKey, params))
+			// 将代理参数和 cookie jar 信息存入 context，供 ModifyResponse 使用
+			outCtx := r.Out.Context()
+			outCtx = context.WithValue(outCtx, proxyParamsKey, params)
+			// 传播 cookie jar 相关 context（从 r.In 到 r.Out）
+			if jar, ok := r.In.Context().Value(cookieJarKey).(*cookiejar.Jar); ok {
+				outCtx = context.WithValue(outCtx, cookieJarKey, jar)
+			}
+			if sid, ok := r.In.Context().Value(cookieSessionIDKey).(string); ok {
+				outCtx = context.WithValue(outCtx, cookieSessionIDKey, sid)
+			}
+			if isNew, ok := r.In.Context().Value(cookieSessionNewKey).(bool); ok {
+				outCtx = context.WithValue(outCtx, cookieSessionNewKey, isNew)
+			}
+			if keys, ok := r.In.Context().Value(cookieSyncKeysKey).([]string); ok {
+				outCtx = context.WithValue(outCtx, cookieSyncKeysKey, keys)
+			}
+			r.Out = r.Out.WithContext(outCtx)
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			params, ok := resp.Request.Context().Value(proxyParamsKey).(*proxyParams)
@@ -185,6 +213,15 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 			return h.processResponse(resp, params)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// context canceled 是客户端主动断开连接，非服务端错误
+			if r.Context().Err() != nil {
+				logger.Debug("客户端断开连接，请求取消",
+					zap.String("method", r.Method),
+					zap.String("path", r.URL.Path),
+					zap.Error(err),
+				)
+				return
+			}
 			logger.Error("代理请求失败",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
@@ -207,6 +244,7 @@ type ciferaHandler struct {
 	logger     *zap.Logger
 	negotiator *compress.Negotiator
 	cache      *cache.Cache
+	cookieMgr  *cookiejar.Manager
 	// 并发控制信号量，限制同时处理的代理请求数
 	sem chan struct{}
 	// addon 规则匹配结果缓存（正则匹配开销大，短生命周期缓存减少重复计算）
@@ -217,6 +255,50 @@ type ciferaHandler struct {
 func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 解析代理参数
 	params := parseProxyParams(r, h.logger)
+
+	// Cookie Jar 会话处理
+	if h.cookieMgr != nil && params.host != "" {
+		// 从请求中获取 _cifera_sid cookie
+		var sessionID string
+		if c, err := r.Cookie(constant.CookieSessionID); err == nil {
+			sessionID = c.Value
+		}
+
+		// 获取或创建 jar
+		jar, sid, isNew := h.cookieMgr.GetOrCreateJar(sessionID)
+
+		// 用 jar 中的 cookie 替换请求的 Cookie 头
+		jarCookies := jar.Cookies(params.host, r.URL.Path)
+		if len(jarCookies) > 0 {
+			r.Header.Set("Cookie", buildCookieHeader(jarCookies))
+		} else {
+			r.Header.Del("Cookie")
+		}
+
+		// 解析 Cifera-Cookie-Sync 头：客户端 JS 修改的脏 cookie 同步到 jar
+		var cookieSyncKeys []string
+		if syncHeader := r.Header.Get(constant.HeaderCookieSync); syncHeader != "" {
+			if syncCookies, err := decodeCookieSyncHeader(syncHeader); err == nil {
+				for _, c := range syncCookies {
+					jar.AddCookie(c, params.host)
+					// 记录 cookie key（name|path），用于 ACK 响应
+					cookieSyncKeys = append(cookieSyncKeys, c.Name+"|"+c.Path)
+				}
+				// 客户端同步的 cookie 也需要持久化
+				h.cookieMgr.PersistJar(sid, jar)
+			}
+		}
+
+		// 将 jar 信息存入 context，供 ModifyResponse 使用
+		ctx := r.Context()
+		ctx = context.WithValue(ctx, cookieJarKey, jar)
+		ctx = context.WithValue(ctx, cookieSessionIDKey, sid)
+		ctx = context.WithValue(ctx, cookieSessionNewKey, isNew)
+		if len(cookieSyncKeys) > 0 {
+			ctx = context.WithValue(ctx, cookieSyncKeysKey, cookieSyncKeys)
+		}
+		r = r.WithContext(ctx)
+	}
 
 	// addon block 检查
 	if params.host != "" {
@@ -332,6 +414,8 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 	originalURL := buildOriginalURL(params.schema, params.host, resp.Request.URL)
 
 	// 处理 addon replace / replace_content 规则
+	// 替换后跳过中间处理步骤，但仍需压缩
+	isReplaced := false
 	if replaceResult := addon.MatchReplace(h.addons, originalURL); replaceResult != nil {
 		switch replaceResult.Rule.Action {
 		case addon.ActionReplace:
@@ -344,13 +428,13 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 			resp.Header.Del("Content-Encoding")
 			resp.StatusCode = http.StatusOK
 			resp.Status = http.StatusText(http.StatusOK)
+			isReplaced = true
 
 			h.logger.Debug("addon 替换响应",
 				zap.String("addon_id", replaceResult.AddonID),
 				zap.String("url", originalURL),
 				zap.String("content_type", replaceResult.Rule.ContentType()),
 			)
-			return nil
 
 		case addon.ActionReplaceContent:
 			// 仅替换响应体，保留原始响应头
@@ -359,94 +443,141 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 			resp.ContentLength = int64(len(body))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 			resp.Header.Del("Content-Encoding")
+			isReplaced = true
 
 			h.logger.Debug("addon 替换响应体",
 				zap.String("addon_id", replaceResult.AddonID),
 				zap.String("url", originalURL),
 			)
-			return nil
 		}
 	}
 
-	// 处理重定向 Location
-	if isRedirect(resp.StatusCode) {
-		rewriteRedirectLocation(resp, params)
-		h.logger.Debug("重定向响应",
-			zap.Int("status", resp.StatusCode),
-			zap.String("location", resp.Header.Get("Location")),
-		)
-	}
+	if !isReplaced {
+		// 处理重定向 Location
+		if isRedirect(resp.StatusCode) {
+			rewriteRedirectLocation(resp, params)
+			h.logger.Debug("重定向响应",
+				zap.Int("status", resp.StatusCode),
+				zap.String("location", resp.Header.Get("Location")),
+			)
+		}
 
-	// 处理 Set-Cookie：重写 Domain 和 Path
-	rewriteCookies(resp, params)
+		// Cookie Jar：拦截 Set-Cookie，存入 jar，从响应中移除
+		if h.cookieMgr != nil {
+			if jar, ok := resp.Request.Context().Value(cookieJarKey).(*cookiejar.Jar); ok {
+				setCookies := extractSetCookies(resp)
+				if len(setCookies) > 0 {
+					for _, c := range setCookies {
+						jar.AddCookie(c, params.host)
+					}
+					// 持久化 jar
+					if sid, sidOk := resp.Request.Context().Value(cookieSessionIDKey).(string); sidOk {
+						h.cookieMgr.PersistJar(sid, jar)
+					}
+				}
+				// 新会话：在响应中设置 _cifera_sid cookie（添加到 resp.Header，
+				// 由 ReverseProxy 写回客户端，避免被代理覆盖）
+				if isNew, ok := resp.Request.Context().Value(cookieSessionNewKey).(bool); ok && isNew {
+					if sid, sidOk := resp.Request.Context().Value(cookieSessionIDKey).(string); sidOk {
+						cookie := &http.Cookie{
+							Name:     constant.CookieSessionID,
+							Value:    sid,
+							Path:     "/",
+							HttpOnly: true,
+							SameSite: http.SameSiteLaxMode,
+						}
+						resp.Header.Add("Set-Cookie", cookie.String())
+					}
+				}
+			}
+		} else {
+			// Cookie Jar 未启用：保留原有的 Set-Cookie 重写行为
+			rewriteCookiesLegacy(resp, params)
+		}
 
-	// 匹配 addon inject 规则
-	injectItems := addon.MatchInject(h.addons, originalURL)
+		// Cifera-Cookie-Ack：确认客户端 cookie 同步成功
+		if keys, ok := resp.Request.Context().Value(cookieSyncKeysKey).([]string); ok && len(keys) > 0 {
+			resp.Header.Set(constant.HeaderCookieAck, strings.Join(keys, ","))
+		}
 
-	// 检测 Content-Type 是否为 HTML
-	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-	isHTML := strings.Contains(contentType, "text/html")
+		// 匹配 addon inject 规则
+		injectItems := addon.MatchInject(h.addons, originalURL)
 
-	// 处理上游压缩的 HTML：需要解压后才能改写
-	contentEncoding := resp.Header.Get("Content-Encoding")
-	if isHTML && contentEncoding != "" {
-		if err := decompressResponseBody(resp, contentEncoding); err != nil {
-			h.logger.Error("解压上游 HTML 响应失败",
+		// 检测 Content-Type 是否为 HTML
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		isHTML := strings.Contains(contentType, "text/html")
+
+		// 处理上游压缩的 HTML：需要解压后才能改写
+		contentEncoding := resp.Header.Get("Content-Encoding")
+		if isHTML && contentEncoding != "" {
+			if err := decompressResponseBody(resp, contentEncoding); err != nil {
+				h.logger.Error("解压上游 HTML 响应失败",
+					zap.String("host", params.host),
+					zap.String("path", params.currentPath),
+					zap.String("encoding", contentEncoding),
+					zap.Error(err),
+				)
+				return err
+			}
+		}
+
+		// 非 HTML 且上游已压缩：透传压缩响应（无需解压和改写）
+		// 直接跳过 HTML 改写和代理层压缩
+		if !isHTML && contentEncoding != "" {
+			h.logger.Debug("透传上游压缩响应",
 				zap.String("host", params.host),
 				zap.String("path", params.currentPath),
 				zap.String("encoding", contentEncoding),
-				zap.Error(err),
 			)
-			return err
+			// 缓存：不缓存已压缩响应（不同客户端支持不同算法，缓存统一未压缩版本更灵活）
+			return nil
 		}
-	}
 
-	// 非 HTML 且上游已压缩：透传压缩响应（无需解压和改写）
-	// 直接跳过 HTML 改写和代理层压缩
-	if !isHTML && contentEncoding != "" {
-		h.logger.Debug("透传上游压缩响应",
-			zap.String("host", params.host),
-			zap.String("path", params.currentPath),
-			zap.String("encoding", contentEncoding),
-		)
-		// 缓存：不缓存已压缩响应（不同客户端支持不同算法，缓存统一未压缩版本更灵活）
-		return nil
-	}
-
-	// 处理 HTML 响应 body 改写
-	proxyBase := params.entryScheme + "://" + params.proxy
-	if isHTML {
-		if err := rewriter.RewriteResponse(resp, h.runtimeJS, proxyBase, params.currentPath, params.host, params.schema, params.referer, params.pageOrigin, injectItems, h.logger); err != nil {
-			h.logger.Error("改写 HTML 响应失败",
-				zap.String("host", params.host),
-				zap.String("path", params.currentPath),
-				zap.Error(err),
-			)
-			return err
-		}
-	}
-
-	// 缓存：异步存储非 HTML、可缓存的响应（压缩前缓存，确保缓存通用性）
-	if h.cache != nil && !isHTML {
-		req := resp.Request
-		if req != nil && cache.IsCacheable(resp, req) {
-			// 读取 body 用于缓存
-			body, err := io.ReadAll(resp.Body)
-			if err == nil {
-				cacheKey := cache.BuildCacheKey(params.schema, params.host, req.URL.RequestURI())
-				// 异步写入缓存，不阻塞响应
-				h.cache.SetAsync(cacheKey, resp.Header, body, resp.StatusCode)
-				h.logger.Debug("缓存异步存储",
-					zap.String("key", cacheKey),
-					zap.Int("size", len(body)),
+		// 处理 HTML 响应 body 改写
+		proxyBase := params.entryScheme + "://" + params.proxy
+		if isHTML {
+			// 构建 cookiesJSON：将 Cookie Jar 中当前 host 的 cookie 序列化为 JSON
+			var cookiesJSON string
+			if h.cookieMgr != nil {
+				if jar, ok := resp.Request.Context().Value(cookieJarKey).(*cookiejar.Jar); ok {
+					jarCookies := jar.Cookies(params.host, params.currentPath)
+					if len(jarCookies) > 0 {
+						cookiesJSON = buildCookiesJSON(jarCookies)
+					}
+				}
+			}
+			if err := rewriter.RewriteResponse(resp, h.runtimeJS, proxyBase, params.currentPath, params.host, params.schema, params.referer, cookiesJSON, injectItems, h.logger); err != nil {
+				h.logger.Error("改写 HTML 响应失败",
+					zap.String("host", params.host),
+					zap.String("path", params.currentPath),
+					zap.Error(err),
 				)
-				// 重置 body 供后续压缩和写入
-				resp.Body = io.NopCloser(bytes.NewReader(body))
+				return err
+			}
+		}
+
+		// 缓存：异步存储非 HTML、可缓存的响应（压缩前缓存，确保缓存通用性）
+		if h.cache != nil && !isHTML {
+			req := resp.Request
+			if req != nil && cache.IsCacheable(resp, req) {
+				// 读取 body 用于缓存
+				body, err := io.ReadAll(resp.Body)
+				if err == nil {
+					cacheKey := cache.BuildCacheKey(params.schema, params.host, req.URL.RequestURI())
+					// 异步写入缓存，不阻塞响应
+					h.cache.SetAsync(cacheKey, resp.Header, body, resp.StatusCode)
+					h.logger.Debug("缓存异步存储",
+						zap.String("key", cacheKey),
+						zap.Int("size", len(body)),
+					)
+					// 重置 body 供后续压缩和写入
+					resp.Body = io.NopCloser(bytes.NewReader(body))
+				}
 			}
 		}
 	}
 
-	// 压缩响应（非透传的情况下才压缩）
+	// 压缩响应（替换后的响应也需要压缩；非透传的情况下才压缩）
 	if h.negotiator != nil {
 		origReq := resp.Request
 		if origReq != nil {
@@ -482,22 +613,34 @@ func decompressResponseBody(resp *http.Response, encoding string) error {
 }
 
 // parseProxyParams 从请求中解析代理参数
-// 解析顺序：URL 查询参数 → Referer 头补充 → r.Host 兜底
+// 解析顺序：URL 查询参数 → Cifera-Referer 头 → Referer 头补充 → r.Host 兜底
 func parseProxyParams(r *http.Request, logger *zap.Logger) *proxyParams {
-	_, schema, host, referer := utils.ParseProxyUrl(r.URL)
+	_, schema, host := utils.ParseProxyUrl(r.URL)
 
-	// 从 Referer 中补充缺失的参数
+	// 从 Cifera-Referer 头获取 referer（当前页面的原始 URL）
+	referer := r.Header.Get(constant.HeaderReferer)
+
+	// 从 Referer 头补充缺失的参数，并尝试重构原始 URL 作为 referer
 	if headerRef := r.Header.Get("Referer"); headerRef != "" {
 		if refURL, parseErr := url.Parse(headerRef); parseErr == nil {
-			parsedOrigin, parsedSchema, parsedHost, _ := utils.ParseProxyUrl(refURL)
-			if referer == "" {
-				referer = parsedOrigin
-			}
+			_, parsedSchema, parsedHost := utils.ParseProxyUrl(refURL)
 			if host == "" {
 				host = parsedHost
 			}
 			if schema == "" {
 				schema = parsedSchema
+			}
+			// Cifera-Referer 为空时，从 Referer 头重构原始 URL
+			// 导航请求和子资源请求（img/script 等）无法设置 Cifera-Referer，
+			// 但浏览器会自动发送 Referer 头（代理 URL 格式），
+			// 从中提取 _cifera_h/_cifera_s 重构为源站原始 URL
+			if referer == "" && parsedHost != "" {
+				refURL.Scheme = parsedSchema
+				refURL.Host = parsedHost
+				q := refURL.Query()
+				utils.StripMetaParams(q)
+				refURL.RawQuery = q.Encode()
+				referer = refURL.String()
 			}
 		}
 	}
@@ -534,31 +677,12 @@ func parseProxyParams(r *http.Request, logger *zap.Logger) *proxyParams {
 		entryScheme = "https"
 	}
 
-	// 计算 pageOrigin：当前资源的原始 URL（去掉 _cifera_* 参数后）
-	// 用于 _cifera_r 参数，告知子请求的来源页
-	pageOrigin := ""
-	if host != "" {
-		pageOriginURL := &url.URL{
-			Scheme:  schema,
-			Host:    host,
-			Path:    r.URL.Path,
-			RawPath: r.URL.RawPath,
-		}
-		q := r.URL.Query()
-		q.Del(constant.ProxyHostPrefix)
-		q.Del(constant.ProxySchemaPrefix)
-		q.Del(constant.ProxyRefererPrefix)
-		pageOriginURL.RawQuery = q.Encode()
-		pageOrigin = pageOriginURL.String()
-	}
-
 	return &proxyParams{
 		schema:      schema,
 		host:        host,
 		proxy:       r.Host,
 		entryScheme: entryScheme,
 		referer:     referer,
-		pageOrigin:  pageOrigin,
 		currentPath: currentPath,
 	}
 }
@@ -602,11 +726,9 @@ func buildOriginalURL(schema, host string, reqURL *url.URL) string {
 		Host:   host,
 		Path:   reqURL.Path,
 	}
-	// 复制查询参数，移除代理参数
+	// 复制查询参数，移除所有 _cifera_* 代理参数
 	q := reqURL.Query()
-	q.Del(constant.ProxyHostPrefix)
-	q.Del(constant.ProxySchemaPrefix)
-	q.Del(constant.ProxyRefererPrefix)
+	utils.StripMetaParams(q)
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -708,9 +830,6 @@ func rewriteRedirectLocation(resp *http.Response, params *proxyParams) {
 		if targetScheme != "" && targetScheme != "http" {
 			q.Set("_cifera_s", targetScheme)
 		}
-		if params.pageOrigin != "" {
-			q.Set("_cifera_r", params.pageOrigin)
-		}
 		locURL.RawQuery = q.Encode()
 	} else {
 		q := locURL.Query()
@@ -718,18 +837,15 @@ func rewriteRedirectLocation(resp *http.Response, params *proxyParams) {
 		if params.schema != "" && params.schema != "http" {
 			q.Set("_cifera_s", params.schema)
 		}
-		if params.pageOrigin != "" {
-			q.Set("_cifera_r", params.pageOrigin)
-		}
 		locURL.RawQuery = q.Encode()
 	}
 
 	resp.Header.Set("Location", locURL.String())
 }
 
-// rewriteCookies 重写 Set-Cookie 响应头
+// rewriteCookiesLegacy 重写 Set-Cookie 响应头（Cookie Jar 未启用时的降级行为）
 // 移除 Domain 属性（或改为代理域名），重写 Path 以适配代理路径
-func rewriteCookies(resp *http.Response, params *proxyParams) {
+func rewriteCookiesLegacy(resp *http.Response, params *proxyParams) {
 	cookies := resp.Header.Values("Set-Cookie")
 	if len(cookies) == 0 {
 		return
@@ -747,4 +863,42 @@ func rewriteCookies(resp *http.Response, params *proxyParams) {
 	for _, c := range rewritten {
 		resp.Header.Add("Set-Cookie", c)
 	}
+}
+
+// rewriteCookieString 重写单个 Set-Cookie 头值（降级行为）
+func rewriteCookieString(cookie string) string {
+	parts := strings.Split(cookie, ";")
+	var kept []string
+
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		lower := strings.ToLower(trimmed)
+
+		// 移除 Domain 属性
+		if strings.HasPrefix(lower, "domain=") {
+			continue
+		}
+
+		// 保留其他属性
+		kept = append(kept, part)
+	}
+
+	return strings.Join(kept, ";")
+}
+
+// stripSessionCookie 从 Cookie 头中移除 _cifera_sid cookie
+func stripSessionCookie(cookieHeader string) string {
+	parts := strings.Split(cookieHeader, ";")
+	var kept []string
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if strings.HasPrefix(trimmed, constant.CookieSessionID+"=") {
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return strings.Join(kept, ";")
 }

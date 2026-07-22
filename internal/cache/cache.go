@@ -244,7 +244,6 @@ func (c *Cache) Stats() (hits, misses int64, size int64, count int) {
 
 // BuildCacheKey 构建缓存 key
 // 使用原始 URL（去掉 _cifera_* 参数后）作为 key
-// 同一资源即使 referer 不同，也命中同一缓存条目
 func BuildCacheKey(schema, host string, reqURL string) string {
 	var sb strings.Builder
 	sb.WriteString(schema)

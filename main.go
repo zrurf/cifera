@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -13,6 +14,7 @@ import (
 	"github.com/zrurf/cifera/internal/addon"
 	"github.com/zrurf/cifera/internal/cache"
 	"github.com/zrurf/cifera/internal/compress"
+	"github.com/zrurf/cifera/internal/cookiejar"
 	"github.com/zrurf/cifera/internal/vhost"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -86,7 +88,37 @@ func main() {
 		logger.Info("缓存模块已禁用")
 	}
 
-	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch)
+	// 初始化 Cookie Jar 管理器
+	var cookieMgr *cookiejar.Manager
+	if config.Cookies.Enabled {
+		cleanupInterval := time.Duration(config.Cookies.CleanupInterval) * time.Second
+		if cleanupInterval <= 0 {
+			cleanupInterval = 5 * time.Minute
+		}
+
+		var err error
+		cookieMgr, err = cookiejar.NewManager(cookiejar.Config{
+			Enabled:         true,
+			JarCapacity:     config.Cookies.JarCapacity,
+			PersistPath:     config.Cookies.PersistPath,
+			CleanupInterval: cleanupInterval,
+		}, logger)
+		if err != nil {
+			logger.Fatal("初始化 Cookie Jar 管理器失败", zap.Error(err))
+		}
+		cookieMgr.StartCleanup()
+
+		logger.Info("Cookie Jar 模块已启用",
+			zap.Int("jar_capacity", config.Cookies.JarCapacity),
+			zap.String("persist_path", config.Cookies.PersistPath),
+			zap.Duration("cleanup_interval", cleanupInterval),
+		)
+		defer cookieMgr.Close()
+	} else {
+		logger.Info("Cookie Jar 模块已禁用")
+	}
+
+	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch, cookieMgr)
 	http.Handle("/", handler)
 
 	logger.Info("服务启动", zap.String("listen", config.Server.Listen))
@@ -175,6 +207,12 @@ func setDefaults(v *viper.Viper) {
 	// Cache 默认值
 	v.SetDefault("cache.enabled", true)
 	v.SetDefault("cache.max_size", 256*1024*1024) // 256MB
+
+	// Cookies 默认值
+	v.SetDefault("cookies.enabled", true)
+	v.SetDefault("cookies.jar_capacity", 500)
+	v.SetDefault("cookies.persist_path", "./data/cookies")
+	v.SetDefault("cookies.cleanup_interval", 300) // 秒
 }
 
 // initLog 根据配置初始化日志系统，返回配置完成后的 logger

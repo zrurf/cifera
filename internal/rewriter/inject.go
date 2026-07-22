@@ -17,17 +17,18 @@ var (
 )
 
 // InjectRuntime 在 HTML 中注入代理参数和 JS 运行时
-func InjectRuntime(html []byte, jsContent, host, schema, referer, pageOrigin string) []byte {
-	// 构造 __CIFERA__ 配置
-	config := map[string]string{
+func InjectRuntime(html []byte, jsContent, host, schema, referer, cookiesJSON string) []byte {
+	// 构造 __CIFERA__ 配置（使用 any 类型，避免 cookiesJSON 被 json.Marshal 双重编码）
+	config := map[string]any{
 		"h": host,
 		"s": schema,
 	}
 	if referer != "" {
 		config["r"] = referer
 	}
-	if pageOrigin != "" {
-		config["p"] = pageOrigin
+	if cookiesJSON != "" {
+		// json.RawMessage 让 json.Marshal 直接输出原始 JSON，不做二次编码
+		config["c"] = json.RawMessage(cookiesJSON)
 	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {

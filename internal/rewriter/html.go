@@ -77,7 +77,7 @@ var tagSpecificURLAttrs = map[string]map[string]bool{
 // RewriteHTMLUrls 使用 html.Tokenizer 逐 token 遍历改写 HTML 中的 URL
 // 始终输出 raw 原始字节，通过替换 raw 中的属性值来改写 URL，
 // 绝不使用 token.String() 重新序列化，避免破坏原始 HTML 结构
-func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema, referer string) []byte {
+func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema string) []byte {
 	r := bytes.NewReader(htmlBytes)
 	tokenizer := html.NewTokenizer(r)
 	// 预分配缓冲区：HTML 改写后通常比原始大 20-50%（因代理参数追加）
@@ -107,7 +107,7 @@ func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema, ref
 
 			if needsRewrite(token) {
 				// 构建 属性名→新值 的映射，传入标签名用于标签特定属性判断
-				replacements := buildAttrReplacements(token, proxyBase, currentPath, host, schema, referer)
+				replacements := buildAttrReplacements(token, proxyBase, currentPath, host, schema)
 				if len(replacements) > 0 {
 					modified := applyAttrReplacements(raw, replacements)
 					buf.Write(modified)
@@ -130,7 +130,7 @@ func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema, ref
 			if inStyle {
 				// <style> 标签内文本：改写 CSS url()
 				cssContent := string(raw)
-				rewritten := rewriteCSSURLs(cssContent, proxyBase, currentPath, host, schema, referer)
+				rewritten := rewriteCSSURLs(cssContent, proxyBase, currentPath, host, schema)
 				buf.WriteString(rewritten)
 			} else {
 				// 所有其他文本（包括 <script> 内容）直接透传
@@ -190,7 +190,7 @@ func needsRewrite(token html.Token) bool {
 }
 
 // buildAttrReplacements 构建需要替换的属性映射
-func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schema, referer string) []attrReplacement {
+func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schema string) []attrReplacement {
 	var replacements []attrReplacement
 	isMetaRefresh := false
 	tagName := strings.ToLower(token.Data)
@@ -207,7 +207,7 @@ func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schem
 		attrKey := strings.ToLower(attr.Key)
 		switch {
 		case attrKey == "srcset":
-			newVal := rewriteSrcsetValue(attr.Val, proxyBase, currentPath, host, schema, referer)
+			newVal := rewriteSrcsetValue(attr.Val, proxyBase, currentPath, host, schema)
 			if newVal != attr.Val {
 				replacements = append(replacements, attrReplacement{
 					attrName: attrKey,
@@ -217,7 +217,7 @@ func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schem
 			}
 
 		case attrKey == "style":
-			newVal := rewriteCSSURLs(attr.Val, proxyBase, currentPath, host, schema, referer)
+			newVal := rewriteCSSURLs(attr.Val, proxyBase, currentPath, host, schema)
 			if newVal != attr.Val {
 				replacements = append(replacements, attrReplacement{
 					attrName: attrKey,
@@ -227,7 +227,7 @@ func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schem
 			}
 
 		case attrKey == "content" && isMetaRefresh:
-			newVal := rewriteMetaRefreshContent(attr.Val, proxyBase, currentPath, host, schema, referer)
+			newVal := rewriteMetaRefreshContent(attr.Val, proxyBase, currentPath, host, schema)
 			if newVal != attr.Val {
 				replacements = append(replacements, attrReplacement{
 					attrName: attrKey,
@@ -237,7 +237,7 @@ func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schem
 			}
 
 		case isURLAttr(tagName, attrKey):
-			newVal := utils.BuildProxyUrl(proxyBase, attr.Val, currentPath, host, schema, referer)
+			newVal := utils.BuildProxyUrl(proxyBase, attr.Val, currentPath, host, schema)
 			if newVal != attr.Val {
 				replacements = append(replacements, attrReplacement{
 					attrName: attrKey,
@@ -325,7 +325,7 @@ func replaceAttrValueInRaw(raw, attrName, newVal string) string {
 }
 
 // rewriteSrcsetValue 改写 srcset 属性值
-func rewriteSrcsetValue(value, proxyBase, currentPath, host, schema, referer string) string {
+func rewriteSrcsetValue(value, proxyBase, currentPath, host, schema string) string {
 	entries := strings.Split(value, ",")
 	var rewritten []string
 	for _, entry := range entries {
@@ -339,21 +339,21 @@ func rewriteSrcsetValue(value, proxyBase, currentPath, host, schema, referer str
 		if len(parts) > 1 {
 			descriptor = " " + parts[1]
 		}
-		newURL := utils.BuildProxyUrl(proxyBase, u, currentPath, host, schema, referer)
+		newURL := utils.BuildProxyUrl(proxyBase, u, currentPath, host, schema)
 		rewritten = append(rewritten, newURL+descriptor)
 	}
 	return strings.Join(rewritten, ", ")
 }
 
 // rewriteCSSURLs 改写 CSS 内容中的 url()
-func rewriteCSSURLs(css, proxyBase, currentPath, host, schema, referer string) string {
+func rewriteCSSURLs(css, proxyBase, currentPath, host, schema string) string {
 	return reCSSURL.ReplaceAllStringFunc(css, func(match string) string {
 		submatches := reCSSURL.FindStringSubmatch(match)
 		if len(submatches) < 2 {
 			return match
 		}
 		originalURL := submatches[1]
-		rewritten := utils.BuildProxyUrl(proxyBase, originalURL, currentPath, host, schema, referer)
+		rewritten := utils.BuildProxyUrl(proxyBase, originalURL, currentPath, host, schema)
 		if rewritten == originalURL {
 			return match
 		}
@@ -362,7 +362,7 @@ func rewriteCSSURLs(css, proxyBase, currentPath, host, schema, referer string) s
 }
 
 // rewriteMetaRefreshContent 改写 meta refresh 的 content 属性
-func rewriteMetaRefreshContent(value, proxyBase, currentPath, host, schema, referer string) string {
+func rewriteMetaRefreshContent(value, proxyBase, currentPath, host, schema string) string {
 	lower := strings.ToLower(value)
 	idx := strings.Index(lower, "url=")
 	if idx < 0 {
@@ -372,7 +372,7 @@ func rewriteMetaRefreshContent(value, proxyBase, currentPath, host, schema, refe
 	prefix := value[:idx+4]
 	originalURL := value[idx+4:]
 	originalURL = strings.Trim(originalURL, " \t'\"")
-	rewritten := utils.BuildProxyUrl(proxyBase, originalURL, currentPath, host, schema, referer)
+	rewritten := utils.BuildProxyUrl(proxyBase, originalURL, currentPath, host, schema)
 	if rewritten == originalURL {
 		return value
 	}

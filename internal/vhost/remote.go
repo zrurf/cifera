@@ -9,9 +9,8 @@ import (
 
 // 代理参数常量（避免引入 constant 包依赖）
 const (
-	paramHostPrefix    = "_cifera_h"
-	paramSchemaPrefix  = "_cifera_s"
-	paramRefererPrefix = "_cifera_r"
+	metaParamPrefix  = "_cifera_"
+	metaHeaderPrefix = "Cifera-"
 )
 
 // serveRemote 代理到远程 URL
@@ -36,6 +35,16 @@ func (h *Host) serveRemote(r *http.Request) (*http.Response, error) {
 	req.Header.Del("X-Forwarded-Host")
 	req.Header.Del("X-Forwarded-Proto")
 
+	// 根据 PassMeta 配置决定是否剔除元信息
+	if !h.Config.PassMeta {
+		// 移除所有 Cifera-* 头，避免泄漏到源服务器
+		for key := range req.Header {
+			if strings.HasPrefix(key, metaHeaderPrefix) {
+				req.Header.Del(key)
+			}
+		}
+	}
+
 	// 设置 Host 为远程目标的 host
 	req.Host = targetURL.Host
 
@@ -49,7 +58,8 @@ func (h *Host) serveRemote(r *http.Request) (*http.Response, error) {
 }
 
 // buildRemoteURL 构建远程目标 URL
-// 合并 remote base path + request path，移除 _cifera_* 参数
+// 合并 remote base path + request path
+// PassMeta=false 时移除所有 _cifera_* 参数；PassMeta=true 时保留
 func (h *Host) buildRemoteURL(r *http.Request) (*url.URL, error) {
 	// 复制 remote base URL
 	target := *h.remoteURL
@@ -78,11 +88,15 @@ func (h *Host) buildRemoteURL(r *http.Request) (*url.URL, error) {
 		}
 	}
 
-	// 复制查询参数并移除 _cifera_* 参数
+	// 复制查询参数；PassMeta=false 时移除所有 _cifera_* 参数
 	q := r.URL.Query()
-	q.Del(paramHostPrefix)
-	q.Del(paramSchemaPrefix)
-	q.Del(paramRefererPrefix)
+	if !h.Config.PassMeta {
+		for key := range q {
+			if strings.HasPrefix(key, metaParamPrefix) {
+				q.Del(key)
+			}
+		}
+	}
 	target.RawQuery = q.Encode()
 
 	// 保留 fragment

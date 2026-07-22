@@ -35,6 +35,13 @@ level = 4                   # 压缩级别 (1-22)
 enabled = true              # 是否启用代理层缓存
 max_size = 268435456        # 最大缓存大小（字节），默认 256MB
 
+## Cookie Jar 配置
+[cookies]
+enabled = true               # 是否启用 Cookie Jar（服务端 Cookie 管理）
+jar_capacity = 500           # 每个会话最大 Cookie 数量
+persist_path = "./.data/cookies"  # NutsDB 持久化目录（空则不持久化）
+cleanup_interval = 300       # 过期 Cookie 清理间隔（秒）
+
 ## 虚拟主机配置
 # [[hosts]]
 # name = "0"                # 虚拟主机名称（host）
@@ -43,3 +50,4 @@ max_size = 268435456        # 最大缓存大小（字节），默认 256MB
 # path = "./vhost/0/"       # 本地虚拟主机路径（type 为 local 时必填）
 # priority = "override"     # 优先级，override 或 fallback
 # fallback_status = "4..|5.."       # 回退状态码，正则匹配（fallback 时必填）
+# pass_meta = false         # 是否在转发请求时携带 Cifera 元信息（_cifera_* 参数和 Cifera-* 头）

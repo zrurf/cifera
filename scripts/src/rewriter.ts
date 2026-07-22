@@ -5,11 +5,9 @@
 
 // 从全局变量读取代理参数
 const config = (window as any).__CIFERA__;
-const PROXY_HOST: string = config?.h ?? '';
-const PROXY_SCHEMA: string = config?.s ?? 'http';
-const PROXY_REFERER: string = config?.r ?? '';
-// pageOrigin: 当前页面的原始 URL（去掉 _cifera_* 参数后），用于 _cifera_r
-const PAGE_ORIGIN: string = config?.p ?? '';
+export const PROXY_HOST: string = config?.h ?? '';
+export const PROXY_SCHEMA: string = config?.s ?? 'http';
+export const PROXY_REFERER: string = config?.r ?? '';
 
 // 允许代理改写的协议白名单
 // 只有这些协议的 URL 才会被改写，未知协议（如 jsBridge、weixin 等自定义协议）不拦截
@@ -24,8 +22,8 @@ const ALLOWED_SCHEMES = new Set([
 function shouldSkip(url: string): boolean {
     if (!url || url.trim() === '') return true;
     if (url[0] === '#') return true;
-    // 已包含代理参数，跳过
-    if (url.includes('_cifera_h=')) return true;
+    // 已包含 _cifera_ 前缀参数，跳过
+    if (url.includes('_cifera_')) return true;
 
     // 检查是否包含协议前缀（形如 "xxx:"）
     const colonIdx = url.indexOf(':');
@@ -71,24 +69,30 @@ function normalizeProxyHost(host: string): string {
     }
 
     // 步骤 1：检测并剥离错误拼接的 proxy port
-    // 页面 JS 可能将 window.location.port 拼接到源站 host 或代理 host 上
-    if (proxyPort && host.endsWith(':' + proxyPort)) {
-        const hostname = host.slice(0, host.length - proxyPort.length - 1);
+	// 页面 JS 可能将 window.location.port 拼接到任意 host 上（包括当前源站、其他源站、代理 host）
+	if (proxyPort && host.endsWith(':' + proxyPort)) {
+		const hostname = host.slice(0, host.length - proxyPort.length - 1);
 
-        // hostname 是源站 hostname 本身 → 返回 PROXY_HOST（保留源站端口）
-        if (hostname === originHostname) {
-            return PROXY_HOST;
-        }
-        // hostname 是源站 hostname 的子域 → 返回 hostname（去掉错误端口）
-        if (originHostname && hostname.endsWith('.' + originHostname)) {
-            return hostname;
-        }
-        // hostname 是代理 host 相关 → 去掉端口，继续后续代理 host 检测
-        if (hostname === proxyHost || hostname === proxyHostname ||
-            hostname.endsWith('.' + proxyHost) || hostname.endsWith('.' + proxyHostname)) {
-            host = hostname;
-        }
-    }
+		// hostname 是源站 hostname 本身 → 返回 PROXY_HOST（保留源站端口）
+		if (hostname === originHostname) {
+			return PROXY_HOST;
+		}
+		// hostname 是源站 hostname 的子域 → 返回 hostname（去掉错误端口）
+		if (originHostname && hostname.endsWith('.' + originHostname)) {
+			return hostname;
+		}
+		// hostname 是代理 host 相关 → 去掉端口，继续后续代理 host 检测
+		if (hostname === proxyHost || hostname === proxyHostname ||
+			hostname.endsWith('.' + proxyHost) || hostname.endsWith('.' + proxyHostname)) {
+			host = hostname;
+		} else {
+			// 其他任意 hostname 携带代理端口：
+			// 极大概率是页面 JS 将 window.location.port 拼接到外部 host 上
+			// （如 kb.chaoxing.com + ':' + window.location.port → kb.chaoxing.com:8080）
+			// 剥离端口，与后端 stripProxyPort 逻辑一致
+			host = hostname;
+		}
+	}
 
     // 步骤 2：代理 host 检测（原有逻辑）
     // 完全匹配代理 host（含端口）或代理 hostname（不含端口）
@@ -151,10 +155,6 @@ export function rewriteUrl(url: string, baseUrl?: string): string {
             if (PROXY_SCHEMA && PROXY_SCHEMA !== 'http') {
                 parsed.searchParams.set('_cifera_s', PROXY_SCHEMA);
             }
-            // 追加 _cifera_r：当前页面的原始 URL
-            if (PAGE_ORIGIN) {
-                parsed.searchParams.set('_cifera_r', PAGE_ORIGIN);
-            }
             return parsed.toString();
         }
 
@@ -167,10 +167,6 @@ export function rewriteUrl(url: string, baseUrl?: string): string {
         proxyUrl.searchParams.set('_cifera_h', targetHost);
         if (targetSchema && targetSchema !== 'http') {
             proxyUrl.searchParams.set('_cifera_s', targetSchema);
-        }
-        // 追加 _cifera_r：当前页面的原始 URL
-        if (PAGE_ORIGIN) {
-            proxyUrl.searchParams.set('_cifera_r', PAGE_ORIGIN);
         }
         proxyUrl.hash = parsed.hash;
 

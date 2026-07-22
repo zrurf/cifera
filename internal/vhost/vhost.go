@@ -56,6 +56,10 @@ type HostConfig struct {
 	// FallbackStatus fallback 模式的状态码正则（支持 ! 前缀取反）
 	// 为空时默认 "4..|5.."
 	FallbackStatus string `toml:"fallback_status" mapstructure:"fallback_status"`
+	// PassMeta 是否在转发请求时携带 Cifera 元信息（_cifera_* 参数和 Cifera-* 头）
+	// 开启后，remote vhost 请求将保留元信息，可用于 vhost 间的信息传递
+	// 默认 false：元信息会被剔除，避免泄漏到源站
+	PassMeta bool `toml:"pass_meta" mapstructure:"pass_meta"`
 }
 
 // Host 运行时虚拟主机（已编译/校验）

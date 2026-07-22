@@ -14,7 +14,7 @@ import (
 // RewriteResponse 检测并改写 HTML 响应
 // 如果响应是 text/html 且内容包含实际 HTML 结构，则改写静态 URL 并注入 JS 运行时
 // addonInjects: addon 的 inject 列表，将在运行时 JS 之后注入到 HTML 中
-func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, pageOrigin string, addonInjects []addon.InjectItem, logger *zap.Logger) error {
+func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, cookiesJSON string, addonInjects []addon.InjectItem, logger *zap.Logger) error {
 	// 检测 Content-Type 是否为 HTML
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if !strings.Contains(contentType, "text/html") {
@@ -51,11 +51,11 @@ func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, hos
 		return nil
 	}
 
-	// 改写 HTML 中的静态 URL（pageOrigin 作为 _cifera_r 传递给子资源）
-	rewritten := RewriteHTMLUrls(body, proxyBase, currentPath, host, schema, pageOrigin)
+	// 改写 HTML 中的静态 URL
+	rewritten := RewriteHTMLUrls(body, proxyBase, currentPath, host, schema)
 
-	// 注入 JS 运行时（pageOrigin 作为 __CIFERA__.p 传递给 JS 运行时）
-	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, pageOrigin)
+	// 注入 JS 运行时
+	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, cookiesJSON)
 
 	// 注入 addon 的 JS/CSS
 	if len(addonInjects) > 0 {

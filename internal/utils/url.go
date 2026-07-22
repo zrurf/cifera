@@ -1,26 +1,24 @@
 package utils
 
 import (
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/zrurf/cifera/internal/constant"
 )
 
-func ParseProxyUrl(u *url.URL) (origin string, schema string, host string, referer string) {
+func ParseProxyUrl(u *url.URL) (origin string, schema string, host string) {
 	uri := *u
 	q := uri.Query()
 	schema = q.Get(constant.ProxySchemaPrefix)
 	host = q.Get(constant.ProxyHostPrefix)
-	referer = q.Get(constant.ProxyRefererPrefix)
 	if schema == "" {
 		schema = "http"
 	}
 
-	// 从查询参数中移除代理参数，避免发送到源服务器
-	q.Del(constant.ProxySchemaPrefix)
-	q.Del(constant.ProxyHostPrefix)
-	q.Del(constant.ProxyRefererPrefix)
+	// 从查询参数中移除所有 _cifera_* 参数，避免发送到源服务器
+	StripMetaParams(q)
 	uri.RawQuery = q.Encode()
 
 	uri.Host = host
@@ -71,8 +69,7 @@ func shouldSkipUrl(u string) bool {
 // currentPath: 当前请求的路径（用于解析相对 URL）
 // host: 目标 host
 // schema: 目标 scheme
-// referer: 当前页面的原始 URL（用于 _cifera_r，即该资源的来源页）
-func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema, referer string) string {
+func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema string) string {
 	if shouldSkipUrl(originalUrl) {
 		return originalUrl
 	}
@@ -114,9 +111,6 @@ func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema, referer st
 		if schema != "" && schema != "http" {
 			q.Set(constant.ProxySchemaPrefix, schema)
 		}
-		if referer != "" {
-			q.Set(constant.ProxyRefererPrefix, referer)
-		}
 		resolved.RawQuery = q.Encode()
 		return resolved.String()
 	}
@@ -142,9 +136,6 @@ func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema, referer st
 	if targetSchema != "" && targetSchema != "http" {
 		q.Set(constant.ProxySchemaPrefix, targetSchema)
 	}
-	if referer != "" {
-		q.Set(constant.ProxyRefererPrefix, referer)
-	}
 	proxyURL.RawQuery = q.Encode()
 	proxyURL.Fragment = origURL.Fragment
 
@@ -157,5 +148,28 @@ func ContainsCiferaParam(u string) bool {
 	if err != nil {
 		return false
 	}
-	return parsed.Query().Get(constant.ProxyHostPrefix) != ""
+	for key := range parsed.Query() {
+		if strings.HasPrefix(key, constant.MetaParamPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// StripMetaParams 移除所有 _cifera_ 前缀的查询参数
+func StripMetaParams(q url.Values) {
+	for key := range q {
+		if strings.HasPrefix(key, constant.MetaParamPrefix) {
+			q.Del(key)
+		}
+	}
+}
+
+// StripMetaHeaders 移除所有 Cifera- 前缀的请求头
+func StripMetaHeaders(h http.Header) {
+	for key := range h {
+		if strings.HasPrefix(key, constant.MetaHeaderPrefix) {
+			h.Del(key)
+		}
+	}
 }

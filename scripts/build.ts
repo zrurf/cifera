@@ -10,12 +10,8 @@ const result = await Bun.build({
     target: "browser",
     format: "iife",
     naming: "cifera.runtime.js",
-    minify: {
-        whitespace: true,
-        identifiers: true,
-        syntax: true,
-    },
-    sourcemap: "external",
+    minify: true,
+    sourcemap: "none"
 });
 
 if (!result.success) {
