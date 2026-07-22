@@ -16,3 +16,4 @@ import './interceptors/xhr';
 import './interceptors/dom';
 import './interceptors/worker';
 import './interceptors/navigation';
+import './interceptors/websocket';

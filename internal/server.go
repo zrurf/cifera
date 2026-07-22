@@ -21,6 +21,7 @@ import (
 	"github.com/zrurf/cifera/internal/rewriter"
 	"github.com/zrurf/cifera/internal/utils"
 	"github.com/zrurf/cifera/internal/vhost"
+	"github.com/zrurf/cifera/internal/wsproxy"
 	"go.uber.org/zap"
 )
 
@@ -312,6 +313,31 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(blockResult.Rule.StatusCode)
 			return
 		}
+	}
+
+	// WebSocket Upgrade 检测：如果是 WebSocket 升级请求，交由 wsproxy 处理
+	if wsproxy.IsWebSocketUpgrade(r) && params.host != "" {
+		// 构建 Cookie 字符串（优先使用 Cookie Jar 中的 cookie）
+		cookieStr := r.Header.Get("Cookie")
+
+		// 构建目标路径（移除 _cifera_* 参数）
+		targetPath := r.URL.Path
+		q := r.URL.Query()
+		utils.StripMetaParams(q)
+		if encoded := q.Encode(); encoded != "" {
+			targetPath += "?" + encoded
+		}
+
+		// 将 _cifera_s 中的 ws/wss 协议映射为目标 scheme
+		wsScheme := params.schema
+		if wsScheme == "http" {
+			wsScheme = "ws"
+		} else if wsScheme == "https" {
+			wsScheme = "wss"
+		}
+
+		wsproxy.ProxyWebSocket(w, r, wsScheme, params.host, targetPath, params.referer, cookieStr, h.logger)
+		return
 	}
 
 	// 虚拟主机查找
