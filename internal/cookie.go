@@ -110,3 +110,31 @@ func buildCookiesJSON(cookies []*http.Cookie) string {
 	data, _ := json.Marshal(entries)
 	return string(data)
 }
+
+// buildCookiePushHeader 构建 Cifera-Cookie-Push 头的值
+// 格式与 Cifera-Cookie-Sync 一致：base64(JSON array of cookieSyncEntry)
+// 支持墓碑标记（e = -1）：当 Set-Cookie 的 MaxAge < 0 时表示删除该 cookie
+func buildCookiePushHeader(cookies []*http.Cookie) string {
+	entries := make([]cookieSyncEntry, 0, len(cookies))
+	for _, c := range cookies {
+		entry := cookieSyncEntry{
+			N: c.Name,
+			V: c.Value,
+			P: c.Path,
+			S: c.Secure,
+			H: c.HttpOnly,
+		}
+		if entry.P == "" {
+			entry.P = "/"
+		}
+		if c.MaxAge < 0 {
+			// 删除标记（墓碑）
+			entry.E = -1
+		} else if !c.Expires.IsZero() {
+			entry.E = c.Expires.Unix()
+		}
+		entries = append(entries, entry)
+	}
+	data, _ := json.Marshal(entries)
+	return base64.StdEncoding.EncodeToString(data)
+}

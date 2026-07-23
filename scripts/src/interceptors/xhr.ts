@@ -33,6 +33,14 @@ function processCookieAck(ack: string): void {
     if (fn) fn(ack);
 }
 
+/**
+ * 处理服务端 cookie 增量推送
+ */
+function processCookiePush(push: string): void {
+    const fn = (window as any).__cifera_processCookiePush__;
+    if (fn) fn(push);
+}
+
 const originalOpen = XMLHttpRequest.prototype.open;
 
 XMLHttpRequest.prototype.open = function(
@@ -67,12 +75,16 @@ XMLHttpRequest.prototype.open = function(
             this.setRequestHeader('Cifera-Cookie-Sync', cookieSync);
         }
 
-        // 监听响应，处理 Cifera-Cookie-Ack 头
+        // 监听响应，处理 Cifera-Cookie-Ack 和 Cifera-Cookie-Push 头
         this.addEventListener('load', function() {
             try {
                 const ack = this.getResponseHeader('Cifera-Cookie-Ack');
                 if (ack) {
                     processCookieAck(ack);
+                }
+                const push = this.getResponseHeader('Cifera-Cookie-Push');
+                if (push) {
+                    processCookiePush(push);
                 }
             } catch {
                 // 忽略

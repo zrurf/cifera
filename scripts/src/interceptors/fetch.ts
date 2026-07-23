@@ -35,6 +35,14 @@ function processCookieAck(ack: string): void {
     if (fn) fn(ack);
 }
 
+/**
+ * 处理服务端 cookie 增量推送
+ */
+function processCookiePush(push: string): void {
+    const fn = (window as any).__cifera_processCookiePush__;
+    if (fn) fn(push);
+}
+
 (window as any).fetch = function(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     try {
         let newUrl: string | undefined;
@@ -82,11 +90,15 @@ function processCookieAck(ack: string): void {
         // 改写失败，保持原样
     }
 
-    // 拦截响应，处理 Cifera-Cookie-Ack 头
+    // 拦截响应，处理 Cifera-Cookie-Ack 和 Cifera-Cookie-Push 头
     return originalFetch.call(this, input, init).then(response => {
         const ack = response.headers.get('Cifera-Cookie-Ack');
         if (ack) {
             processCookieAck(ack);
+        }
+        const push = response.headers.get('Cifera-Cookie-Push');
+        if (push) {
+            processCookiePush(push);
         }
         return response;
     });

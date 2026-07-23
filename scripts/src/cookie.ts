@@ -284,9 +284,46 @@ export function processCookieAck(ack: string): void {
     }
 }
 
+/**
+ * 处理服务端增量推送的 cookie 变更（Cifera-Cookie-Push 头）
+ * 格式与 Cifera-Cookie-Sync 一致：base64(JSON array of CookieEntry)
+ * 
+ * 服务端在拦截源站 Set-Cookie 后，通过此头将变更推送到客户端 Shadow Jar，
+ * 使 XHR/fetch 请求的 cookie 变更无需等待下次 HTML 页面加载即可生效。
+ * 
+ * 推送的 cookie 不标记为脏（服务端已经知道这些值，无需再同步回去）
+ */
+export function processCookiePush(pushValue: string): void {
+    if (!pushValue) return;
+
+    try {
+        const decoded = atob(pushValue);
+        const entries: CookieEntry[] = JSON.parse(decoded);
+
+        for (const entry of entries) {
+            if (entry.p === '') entry.p = '/';
+            const key = cookieKey(entry.n, entry.p);
+
+            if (entry.e === -1) {
+                // 墓碑：删除 Shadow Jar 中的 cookie，同时清除脏标记
+                shadowJar.delete(key);
+                dirtySet.delete(key);
+            } else {
+                // 新增/更新：写入 Shadow Jar，不标记为脏
+                shadowJar.set(key, entry);
+                // 如果该 cookie 之前是脏的（客户端也修改了），服务端推送的值覆盖后清除脏标记
+                dirtySet.delete(key);
+            }
+        }
+    } catch {
+        // 解码失败，忽略
+    }
+}
+
 // 挂载到 window，供拦截器使用
 (window as any).__cifera_getCookieSync__ = getCookieSyncHeaderSync;
 (window as any).__cifera_processCookieAck__ = processCookieAck;
+(window as any).__cifera_processCookiePush__ = processCookiePush;
 
 /**
  * 初始化 Cookie 托管系统

@@ -500,6 +500,10 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 					if sid, sidOk := resp.Request.Context().Value(cookieSessionIDKey).(string); sidOk {
 						h.cookieMgr.PersistJar(sid, jar)
 					}
+					// 增量推送 Set-Cookie 变更到客户端 Shadow Jar
+					// 使用 Cifera-Cookie-Push 头（与 Cifera-Cookie-Sync 格式一致）
+					// 客户端 JS 拦截器在 fetch/XHR 响应中读取此头并更新 Shadow Jar
+					resp.Header.Set(constant.HeaderCookiePush, buildCookiePushHeader(setCookies))
 				}
 				// 新会话：在响应中设置 _cifera_sid cookie（添加到 resp.Header，
 				// 由 ReverseProxy 写回客户端，避免被代理覆盖）

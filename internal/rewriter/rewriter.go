@@ -13,7 +13,7 @@ import (
 
 // RewriteResponse 检测并改写 HTML 响应
 // 如果响应是 text/html 且内容包含实际 HTML 结构，则改写静态 URL 并注入 JS 运行时
-// addonInjects: addon 的 inject 列表，将在运行时 JS 之后注入到 HTML 中
+// addonInjects: addon 的 inject 列表，运行时 JS 优先注入（<head> 标签后），addon 注入在其之后
 func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, cookiesJSON string, addonInjects []addon.InjectItem, logger *zap.Logger) error {
 	// 检测 Content-Type 是否为 HTML
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
@@ -54,13 +54,16 @@ func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, hos
 	// 改写 HTML 中的静态 URL
 	rewritten := RewriteHTMLUrls(body, proxyBase, currentPath, host, schema)
 
-	// 注入 JS 运行时
-	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, cookiesJSON)
-
-	// 注入 addon 的 JS/CSS
+	// 先注入 addon 的 JS/CSS，再注入 JS 运行时
+	// 这样 InjectRuntime 会将运行时代码插入到 <head> 标签后（最前面），
+	// 确保所有 addon 注入的 JS（包括 head_start 位置）都在运行时之后，
+	// addon JS 可以使用 cifera runtime 提供的能力和接口
 	if len(addonInjects) > 0 {
 		rewritten = addon.InjectAddons(rewritten, addonInjects)
 	}
+
+	// 注入 JS 运行时（在 <head> 标签后，优先于所有 addon 注入内容）
+	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, cookiesJSON)
 
 	// 设置新 body
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
