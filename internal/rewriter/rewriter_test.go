@@ -57,7 +57,7 @@ func TestRewriteHTMLUrls(t *testing.T) {
 
 func TestInjectRuntime(t *testing.T) {
 	html := []byte("<html><head></head><body>hi</body></html>")
-	out := string(InjectRuntime(html, "console.log(1)", "example.com", "https", "https://example.com/page", ""))
+	out := string(InjectRuntime(html, "console.log(1)", "example.com", "https", "https://example.com/page", "", nil))
 
 	if !strings.HasPrefix(out, "<html><head><script>var __CIFERA__=") {
 		t.Errorf("JS 运行时应注入到 <head> 之后，实际开头: %q", out[:min(len(out), 60)])
@@ -70,10 +70,22 @@ func TestInjectRuntime(t *testing.T) {
 	}
 }
 
+// addons 参数应注入到 __CIFERA__.addons
+func TestInjectRuntimeAddonParams(t *testing.T) {
+	html := []byte("<head></head>")
+	addons := map[string]any{
+		"com.example.theme": map[string]any{"params": map[string]any{"theme": "light"}},
+	}
+	out := string(InjectRuntime(html, "/*js*/", "example.com", "http", "", "", addons))
+	if !strings.Contains(out, `"addons":{"com.example.theme":{"params":{"theme":"light"}}}`) {
+		t.Errorf("应注入 addon 参数，实际: %s", out)
+	}
+}
+
 func TestInjectRuntimeWithCookies(t *testing.T) {
 	html := []byte("<head></head>")
 	cookiesJSON := `[{"n":"a","v":"1","p":"/"}]`
-	out := string(InjectRuntime(html, "/*js*/", "example.com", "http", "", cookiesJSON))
+	out := string(InjectRuntime(html, "/*js*/", "example.com", "http", "", cookiesJSON, nil))
 	// cookiesJSON 应以原始 JSON 直接内联，不做二次编码
 	if !strings.Contains(out, `"c":[{"n":"a","v":"1","p":"/"}]`) {
 		t.Errorf("cookie 配置应内联原始 JSON，实际: %s", out)

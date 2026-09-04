@@ -40,14 +40,14 @@ type Config struct {
 
 // persistTask 表示一个异步持久化任务
 type persistTask struct {
-	sessionID string
-	entries   []CookieEntry
+	jarKey  string
+	entries []CookieEntry
 }
 
 // Manager 管理所有 cookie jar
 type Manager struct {
 	mu              sync.RWMutex
-	jars            map[string]*Jar // key：会话 UUID
+	jars            map[string]*Jar // key：租户命名空间键（tenantID:sessionID）
 	db              *badger.DB      // Badger 持久化实例（禁用持久化时为 nil）
 	logger          *zap.Logger
 	maxPerJar       int
@@ -118,80 +118,92 @@ func (m *Manager) persistWorker() {
 			// 排空通道中剩余任务
 			for len(m.persistCh) > 0 {
 				task := <-m.persistCh
-				m.writeJarToDB(task.sessionID, task.entries)
+				m.writeJarToDB(task.jarKey, task.entries)
 			}
 			return
 		case task := <-m.persistCh:
-			m.writeJarToDB(task.sessionID, task.entries)
+			m.writeJarToDB(task.jarKey, task.entries)
 		}
 	}
 }
 
 // writeJarToDB 将 cookie entries 写入 Badger（仅由持久化相关 goroutine 调用）
-func (m *Manager) writeJarToDB(sessionID string, entries []CookieEntry) {
+func (m *Manager) writeJarToDB(jarKey string, entries []CookieEntry) {
 	if m.db == nil {
 		return
 	}
 
 	if len(entries) == 0 {
-		m.deleteFromDB(sessionID)
+		m.deleteFromDB(jarKey)
 		return
 	}
 
 	data, err := json.Marshal(entries)
 	if err != nil {
 		m.logger.Error("序列化 cookie jar 失败",
-			zap.String("session", sessionID),
+			zap.String("jarKey", jarKey),
 			zap.Error(err),
 		)
 		return
 	}
 
 	if err := m.db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte(sessionID), data)
+		return txn.Set([]byte(jarKey), data)
 	}); err != nil {
 		m.logger.Error("持久化 cookie jar 失败",
-			zap.String("session", sessionID),
+			zap.String("jarKey", jarKey),
 			zap.Error(err),
 		)
 	}
 }
 
-// GetOrCreateJar 获取或创建指定 sessionID 的 jar，返回实际使用的 sessionID 与是否新建（isNew）。
-// sessionID 为空或非法 UUID 时自动生成新 UUID。
-func (m *Manager) GetOrCreateJar(sessionID string) (*Jar, string, bool) {
-	if sessionID == "" || !isValidUUID(sessionID) {
-		sessionID = newUUID()
+// NewSessionID 生成一个新的会话 UUID v4。
+// 会话 ID 是客户端持有的 _cifera_sid cookie 值；
+// 实际 jar 在存储中的键为 jarKey = tenantID:sessionID，见 Tenant.JarKey。
+func NewSessionID() string {
+	return newUUID()
+}
+
+// IsValidSessionID 判断客户端传入的会话 ID 是否为合法 UUID v4
+func IsValidSessionID(s string) bool {
+	return isValidUUID(s)
+}
+
+// GetOrCreateJar 获取或创建指定 jarKey 的 jar，返回 jar 与是否新建（isNew）。
+// jarKey 由调用方拼装（tenantID:sessionID），管理器不解析其内部结构。
+func (m *Manager) GetOrCreateJar(jarKey string) (*Jar, bool) {
+	if jarKey == "" {
+		return nil, false
 	}
 
 	m.mu.RLock()
-	if jar, ok := m.jars[sessionID]; ok {
+	if jar, ok := m.jars[jarKey]; ok {
 		m.mu.RUnlock()
-		return jar, sessionID, false
+		return jar, false
 	}
 	m.mu.RUnlock()
 
 	if m.db != nil {
-		if jar := m.loadJar(sessionID); jar != nil {
+		if jar := m.loadJar(jarKey); jar != nil {
 			m.mu.Lock()
-			m.jars[sessionID] = jar
+			m.jars[jarKey] = jar
 			m.mu.Unlock()
-			return jar, sessionID, false
+			return jar, false
 		}
 	}
 
 	jar := NewJar(m.maxPerJar)
 	m.mu.Lock()
-	m.jars[sessionID] = jar
+	m.jars[jarKey] = jar
 	m.mu.Unlock()
 
-	return jar, sessionID, true
+	return jar, true
 }
 
 // PersistJar 异步持久化 jar 到 Badger。
 // 提取 cookie entries 后发送到持久化通道，不阻塞调用方。
 // 如果通道满则丢弃本次持久化（下次会重试）。
-func (m *Manager) PersistJar(sessionID string, jar *Jar) {
+func (m *Manager) PersistJar(jarKey string, jar *Jar) {
 	if m.db == nil {
 		return
 	}
@@ -199,10 +211,10 @@ func (m *Manager) PersistJar(sessionID string, jar *Jar) {
 	entries := jar.AllCookies()
 	// 非阻塞发送：通道满时丢弃（cleanup 会定期持久化，不会丢数据）
 	select {
-	case m.persistCh <- persistTask{sessionID: sessionID, entries: entries}:
+	case m.persistCh <- persistTask{jarKey: jarKey, entries: entries}:
 	default:
 		m.logger.Debug("持久化通道满，跳过本次持久化",
-			zap.String("session", sessionID),
+			zap.String("jarKey", jarKey),
 		)
 	}
 }

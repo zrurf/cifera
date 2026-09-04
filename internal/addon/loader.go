@@ -15,7 +15,8 @@ import (
 
 // LoadAddons 从指定目录加载 addon
 // enabled 为空时加载全部，否则仅加载其中指定的 addon ID
-func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddon, error) {
+// globalParams：按 addon ID 分组的关键参数值（来自 config 的 addons.params）
+func LoadAddons(dir string, enabled []string, globalParams map[string]map[string]any, logger *zap.Logger) ([]*LoadedAddon, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("解析 addon 目录路径失败: %w", err)
@@ -69,8 +70,18 @@ func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddo
 			continue
 		}
 
+		// 解析 addon 参数（全局关键参数 + addon 声明）
+		params, err := ResolveParams(manifest.Params, globalParams[manifest.Addon.ID])
+		if err != nil {
+			logger.Error("解析 addon 参数失败",
+				zap.String("id", manifest.Addon.ID),
+				zap.Error(err),
+			)
+			continue
+		}
+
 		// 编译正则并加载资源
-		if err := compileRules(manifest, addonDir, logger); err != nil {
+		if err := compileRules(manifest, addonDir, params, logger); err != nil {
 			logger.Error("编译 addon 规则失败",
 				zap.String("id", manifest.Addon.ID),
 				zap.Error(err),
@@ -95,8 +106,10 @@ func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddo
 		}
 
 		addons = append(addons, &LoadedAddon{
-			Manifest: *manifest,
-			Dir:      addonDir,
+			Manifest:        *manifest,
+			Dir:             addonDir,
+			Params:          params,
+			globalOverrides: globalParams[manifest.Addon.ID],
 		})
 
 		ruleCount := len(manifest.Rules)
@@ -138,12 +151,34 @@ func parseManifest(path string) (*AddonManifest, error) {
 	if len(manifest.Rules) == 0 && len(manifest.Hosts) == 0 {
 		return nil, fmt.Errorf("至少需要一条 rule 或一个 host 配置")
 	}
+	// 校验参数声明
+	if err := validateParams(manifest.Params); err != nil {
+		return nil, err
+	}
 
 	return &manifest, nil
 }
 
-// compileRules 编译正则表达式并加载资源文件
-func compileRules(manifest *AddonManifest, addonDir string, logger *zap.Logger) error {
+// validateParams 校验参数声明的基本合法性
+func validateParams(params []ParamDef) error {
+	seen := make(map[string]bool)
+	for i, p := range params {
+		if p.Name == "" {
+			return fmt.Errorf("params[%d]: name 不能为空", i)
+		}
+		if seen[p.Name] {
+			return fmt.Errorf("params[%d]: 参数名重复: %s", i, p.Name)
+		}
+		seen[p.Name] = true
+		if _, err := zeroByType(p.Type); err != nil {
+			return fmt.Errorf("params[%d] (%s): %w", i, p.Name, err)
+		}
+	}
+	return nil
+}
+
+// compileRules 编译正则表达式，加载资源文件并按参数渲染模板
+func compileRules(manifest *AddonManifest, addonDir string, params map[string]any, logger *zap.Logger) error {
 	for i := range manifest.Rules {
 		rule := &manifest.Rules[i]
 
@@ -173,12 +208,29 @@ func compileRules(manifest *AddonManifest, addonDir string, logger *zap.Logger) 
 			if err != nil {
 				return fmt.Errorf("rule[%d]: 加载资源文件失败 (%s): %w", i, resourcePath, err)
 			}
-			rule.resourceContent = content
+			renderResourceContent(rule, content, params, logger)
+			rule.rawContent = content
 			rule.resourceType = detectResourceType(rule.Resource)
+			// 预分配租户渲染缓存，避免按值复制 Rule 后并发写指针（详见 ResourceContentFor）
+			rule.tenantCache = &ruleTenantCache{}
 		}
 	}
 
 	return nil
+}
+
+// renderResourceContent 按参数渲染资源模板；模板渲染失败时保留原始内容（容错，避免误伤含字面 {{ 的资源）
+func renderResourceContent(rule *Rule, content []byte, params map[string]any, logger *zap.Logger) {
+	rendered, err := RenderResource(content, params)
+	if err != nil {
+		logger.Debug("addon 资源模板渲染失败，使用原始内容",
+			zap.String("resource", rule.Resource),
+			zap.Error(err),
+		)
+		rule.resourceContent = content
+		return
+	}
+	rule.resourceContent = rendered
 }
 
 // validateRules 验证规则合法性
@@ -205,18 +257,39 @@ func validateRules(manifest *AddonManifest, logger *zap.Logger) error {
 			if !rule.HasResource() {
 				return fmt.Errorf("rule[%d]: action=inject 必须指定 resource", i)
 			}
-			// inject 必须指定 position
-			if rule.Position == "" {
-				return fmt.Errorf("rule[%d]: action=inject 必须指定 position", i)
-			}
 			// inject 仅支持 JS 和 CSS 资源
 			if rule.resourceType != ResourceTypeJS && rule.resourceType != ResourceTypeCSS {
 				return fmt.Errorf("rule[%d]: action=inject 仅支持 JS 和 CSS 资源，当前: %s", i, rule.resourceType)
 			}
-			switch rule.Position {
-			case PositionHeadStart, PositionHeadEnd, PositionBodyStart, PositionBodyEnd:
-			default:
-				return fmt.Errorf("rule[%d]: 不支持的 position: %s", i, rule.Position)
+
+			// position 与 at 二选一，不可同时缺失或同时指定
+			if (rule.Position == "") == (rule.At == "") {
+				return fmt.Errorf("rule[%d]: action=inject 必须且只能指定 position 或 at 之一", i)
+			}
+
+			if rule.At != "" {
+				// 选择器注入：校验 relation 与 scope，并补充默认值
+				switch rule.Relation {
+				case RelationBefore, RelationAfter, RelationPrepend, RelationAppend:
+				default:
+					return fmt.Errorf("rule[%d]: 选择器注入无效的 relation: %s", i, rule.Relation)
+				}
+				if rule.Scope == "" {
+					// JS 默认仅首个命中，CSS 默认全部命中（实例级筛选）
+					if rule.resourceType == ResourceTypeCSS {
+						manifest.Rules[i].Scope = ScopeAll
+					} else {
+						manifest.Rules[i].Scope = ScopeFirst
+					}
+				} else if rule.Scope != ScopeFirst && rule.Scope != ScopeAll {
+					return fmt.Errorf("rule[%d]: 选择器注入无效的 scope: %s", i, rule.Scope)
+				}
+			} else {
+				switch rule.Position {
+				case PositionHeadStart, PositionHeadEnd, PositionBodyStart, PositionBodyEnd:
+				default:
+					return fmt.Errorf("rule[%d]: 不支持的 position: %s", i, rule.Position)
+				}
 			}
 		}
 

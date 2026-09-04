@@ -58,21 +58,32 @@ func TestManagerCleanup(t *testing.T) {
 	m.Close()
 }
 
-// 无效或缺失的 sessionID 应自动生成新 UUID
-func TestGetOrCreateJarGeneratesSessionID(t *testing.T) {
+// 相同 jarKey 返回同一 jar；不同租户命名空间互相隔离
+func TestGetOrCreateJarKey(t *testing.T) {
 	m, err := NewManager(Config{JarCapacity: 100}, zap.NewNop())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
-	for _, sid := range []string{"", "not-a-uuid"} {
-		_, actual, isNew := m.GetOrCreateJar(sid)
-		if !isNew {
-			t.Errorf("sessionID=%q 应视为新会话", sid)
-		}
-		if !isValidUUID(actual) {
-			t.Errorf("应生成合法 UUID，实际 %q", actual)
-		}
+	jar1, isNew1 := m.GetOrCreateJar("tenantA:sid1")
+	if !isNew1 {
+		t.Error("首次创建应标记为新会话")
+	}
+	jar2, isNew2 := m.GetOrCreateJar("tenantA:sid1")
+	if isNew2 || jar1 != jar2 {
+		t.Error("相同 jarKey 应返回同一个 jar")
+	}
+	jar3, _ := m.GetOrCreateJar("tenantB:sid1")
+	if jar1 == jar3 {
+		t.Error("不同租户命名空间应互相隔离")
+	}
+}
+
+// TestNewSessionID 生成的会话 ID 应为合法 UUID v4
+func TestNewSessionID(t *testing.T) {
+	sid := NewSessionID()
+	if !IsValidSessionID(sid) {
+		t.Errorf("NewSessionID 应生成合法 UUID v4，实际 %q", sid)
 	}
 }

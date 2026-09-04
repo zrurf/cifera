@@ -16,8 +16,9 @@ var (
 	reHTMLTag   = regexp.MustCompile(`(?i)<html[^>]*>`)
 )
 
-// InjectRuntime 在 HTML 中注入代理参数和 JS 运行时
-func InjectRuntime(html []byte, jsContent, host, schema, referer, cookiesJSON string) []byte {
+// InjectRuntime 在 HTML 中注入代理参数和 JS 运行时。
+// addonsParams 为各 addon 在浏览器侧可见的参数表：addonID → {params: {...}}；nil 时不注入。
+func InjectRuntime(html []byte, jsContent, host, schema, referer, cookiesJSON string, addonsParams map[string]any) []byte {
 	// 构造 __CIFERA__ 配置
 	config := map[string]any{
 		"h": host,
@@ -29,6 +30,10 @@ func InjectRuntime(html []byte, jsContent, host, schema, referer, cookiesJSON st
 	if cookiesJSON != "" {
 		// json.RawMessage 让 json.Marshal 直接输出原始 JSON，不做二次编码
 		config["c"] = json.RawMessage(cookiesJSON)
+	}
+	if len(addonsParams) > 0 {
+		// 注入各 addon 参数，供浏览器侧读取
+		config["addons"] = addonsParams
 	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {

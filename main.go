@@ -21,6 +21,7 @@ import (
 	"github.com/zrurf/cifera/internal/cache"
 	"github.com/zrurf/cifera/internal/compress"
 	"github.com/zrurf/cifera/internal/cookiejar"
+	"github.com/zrurf/cifera/internal/tenant"
 	"github.com/zrurf/cifera/internal/vhost"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -45,7 +46,7 @@ func main() {
 	logger = initLog(logger, config.Log)
 	defer logger.Sync()
 
-	addons, err := addon.LoadAddons(config.Addons.Dir, config.Addons.Enabled, logger)
+	addons, err := addon.LoadAddons(config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, logger)
 	if err != nil {
 		logger.Fatal("加载 addon 失败", zap.Error(err))
 	}
@@ -116,12 +117,31 @@ func main() {
 		logger.Info("Cookie Jar 模块已禁用")
 	}
 
-	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch, cookieMgr)
+	// 注册租户（自动租户无需预分配）
+	var tstore *tenant.Store
+	if len(config.Tenants) > 0 {
+		regs := make([]tenant.Registration, 0, len(config.Tenants))
+		for id, tc := range config.Tenants {
+			regs = append(regs, tenant.Registration{
+				ID:            id,
+				Name:          tc.Name,
+				Enabled:       tc.Enabled,
+				TokenTTL:      time.Duration(tc.TokenTTL) * time.Second,
+				Secret:        tc.Secret,
+				AddonParams:   tc.AddonParams,
+				EnabledAddons: tc.EnabledAddons,
+			})
+		}
+		tstore = tenant.NewStore(regs)
+		logger.Info("注册租户已启用", zap.Int("count", len(regs)))
+	}
+
+	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch, cookieMgr, config.Server.APIHost, tstore)
 
 	// addon 热加载：目录存在时监听变更并自动重新加载
 	if stat, err := os.Stat(config.Addons.Dir); err == nil && stat.IsDir() {
 		if reloader, ok := handler.(interface{ ReplaceAddons([]*addon.LoadedAddon) }); ok {
-			watchAddonsDir(config.Addons.Dir, config.Addons.Enabled, reloader.ReplaceAddons, logger)
+			watchAddonsDir(config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, reloader.ReplaceAddons, logger)
 		}
 	}
 
@@ -319,7 +339,7 @@ func initLog(baseLogger *zap.Logger, config internal.LogConfig) *zap.Logger {
 }
 
 // watchAddonsDir 监听 addon 目录及其一级子目录，变更后防抖触发重载
-func watchAddonsDir(dir string, enabled []string, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
+func watchAddonsDir(dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Warn("初始化 addon 热加载失败", zap.Error(err))
@@ -347,7 +367,7 @@ func watchAddonsDir(dir string, enabled []string, replace func([]*addon.LoadedAd
 			mu.Lock()
 			timer = nil
 			mu.Unlock()
-			reloadAddons(dir, enabled, replace, logger)
+			reloadAddons(dir, enabled, globalParams, replace, logger)
 		})
 	}
 
@@ -384,8 +404,8 @@ func watchAddonsSubdirs(w *fsnotify.Watcher, dir string) {
 }
 
 // reloadAddons 重新加载 addon 并原子替换运行时列表
-func reloadAddons(dir string, enabled []string, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
-	addons, err := addon.LoadAddons(dir, enabled, logger)
+func reloadAddons(dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
+	addons, err := addon.LoadAddons(dir, enabled, globalParams, logger)
 	if err != nil {
 		logger.Error("addon 热加载失败", zap.Error(err))
 		return

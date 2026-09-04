@@ -4,8 +4,10 @@ go 1.26.5
 
 require (
 	github.com/andybalholm/brotli v1.2.2
+	github.com/andybalholm/cascadia v1.3.4
 	github.com/dgraph-io/badger/v4 v4.9.6
 	github.com/fsnotify/fsnotify v1.9.0
+	github.com/go-chi/chi/v5 v5.3.2
 	github.com/klauspost/compress v1.19.0
 	github.com/lxzan/gws v1.10.0
 	github.com/pelletier/go-toml/v2 v2.2.4

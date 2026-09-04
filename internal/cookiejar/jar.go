@@ -127,6 +127,35 @@ func (j *Jar) removeCookie(domain, key string) {
 	}
 }
 
+// RemoveCookie 删除指定 name 在 domain/path 下的 cookie（供 API 跨域删除）。
+// domain 为空时删除匹配该 name+path 的所有条目。
+func (j *Jar) RemoveCookie(name, domain, path string) int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	if path == "" {
+		path = "/"
+	}
+	key := cookieKey(name, path)
+
+	if domain != "" {
+		domain = strings.ToLower(canonicalDomain(domain))
+		if _, ok := j.cookies[domain]; !ok {
+			return 0
+		}
+		j.removeCookie(domain, key)
+		return 1
+	}
+
+	// 未指定 domain：遍历删除
+	count := 0
+	for d := range j.cookies {
+		j.removeCookie(d, key)
+		count++
+	}
+	return count
+}
+
 // evictIfNeeded 容量已满时淘汰最早创建的 cookie
 func (j *Jar) evictIfNeeded() {
 	total := j.totalCount()
@@ -140,7 +169,10 @@ func (j *Jar) evictIfNeeded() {
 
 	for domain, m := range j.cookies {
 		for key, entry := range m {
-			if oldest == nil || entry.Created.Before(oldest.Created) {
+			// 同一时刻创建（Created 相等）时按 key 字典序淘汰较小的，
+			// 保证容量淘汰结果确定，避免 map 遍历顺序随机导致 flaky。
+			if oldest == nil || entry.Created.Before(oldest.Created) ||
+				(entry.Created.Equal(oldest.Created) && key < oldestKey) {
 				oldest = entry
 				oldestDomain = domain
 				oldestKey = key
@@ -210,6 +242,7 @@ func (j *Jar) Cookies(host, path string) []*http.Cookie {
 			Path:     entry.Path,
 			Domain:   entry.Domain,
 			Expires:  entry.Expires,
+			MaxAge:   entry.MaxAge,
 			Secure:   entry.Secure,
 			HttpOnly: entry.HttpOnly,
 			SameSite: http.SameSite(entry.SameSite),

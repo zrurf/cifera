@@ -1,5 +1,6 @@
 [server]
 listen = ":8080"            # 监听地址
+api_host = "api.cifera"     # 内置 API vhost 保留主机名，空则不启用
 # tls_cert = "./cert.pem"   # HTTPS 证书文件（与 tls_key 同时配置时启用 HTTPS 监听）
 # tls_key = "./key.pem"     # HTTPS 私钥文件
 
@@ -15,6 +16,10 @@ max_backups = 3             # 最大备份文件数量
 [addons]
 dir = "./addons"            # addon 加载目录
 # enabled = []              # 仅加载指定 addon（按 id），若缺省或为空则加载全部
+
+## 全局 addon 参数（可选）：为指定 addon 设置参数值，供其资源模板渲染
+[addons.params]
+# <addon_id> = { key = "value" }   # 例如：com.example.theme = { theme = "light" }
 
 ## 压缩配置
 [compression]
@@ -53,3 +58,14 @@ cleanup_interval = 300       # 过期 Cookie 清理间隔（秒）
 # priority = "override"     # 优先级，override 或 fallback
 # fallback_status = "4..|5.."       # 回退状态码，正则匹配（fallback 时必填）
 # pass_meta = false         # 是否在转发请求时携带 Cifera 元信息（_cifera_* 参数和 Cifera-* 头）
+
+## 注册租户配置（可选）：注册租户需持有合法 token 方可访问；自动租户无需在此配置
+# [tenants]
+# [tenants.<tenant_id>]      # 租户 ID
+# name = "示例租户"           # 租户名称
+# enabled = true             # 是否启用
+# token_ttl = 86400          # token 有效期（秒），默认 86400
+# secret = "xxx"             # 可选接入密钥（鉴权阶段换取 token 用）
+# enabled_addons = ["addon_id"]   # 可选，限定该租户可用的 addon（为空则全部可用）
+# [tenants.<tenant_id>.addon_params]   # 可选，addon_id → 参数覆盖（叠加在全局参数之上）
+# addon_id = { key = "value" }

@@ -3,6 +3,8 @@ package addon
 import (
 	"fmt"
 	"regexp"
+
+	"github.com/zrurf/cifera/internal/inject"
 )
 
 // 定位 HTML 注入位置的正则（与 rewriter/inject.go 保持一致）
@@ -13,9 +15,66 @@ var (
 	reBodyClose = regexp.MustCompile(`(?i)</body>`)
 )
 
-// InjectAddons 按 position 在 HTML 中注入 addon 的 JS/CSS
-// 同 position 按列表顺序注入；JS 用 <script> 包裹，CSS 用 <style> 包裹
+// InjectAddons 在 HTML 中注入 addon 的 JS/CSS
+// 支持两类位置：文档级 position（head_start 等）与 CSS 选择器注入（at）。
+// 位置注入按列表顺序分组注入；JS 用 <script> 包裹，CSS 用 <style> 包裹。
 func InjectAddons(html []byte, injects []InjectItem) []byte {
+	if len(injects) == 0 {
+		return html
+	}
+
+	result := html
+	var selectorItems []inject.Item
+	var positionInjects []InjectItem
+
+	for _, item := range injects {
+		if item.At != "" {
+			selectorItems = append(selectorItems, buildSelectorItem(item))
+		} else {
+			positionInjects = append(positionInjects, item)
+		}
+	}
+
+	if len(selectorItems) > 0 {
+		out, err := inject.InjectBySelector(result, selectorItems)
+		if err == nil {
+			result = out
+		} else {
+			// 选择器注入失败（如选择器无效）时降级：作为 body_end 位置注入，避免返回损坏页面
+			for _, s := range selectorItems {
+				positionInjects = append(positionInjects, InjectItem{
+					Position:     PositionBodyEnd,
+					Content:      s.Content,
+					ResourceType: selectorResourceType(s.IsCSS),
+				})
+			}
+		}
+	}
+
+	return injectByPosition(result, positionInjects)
+}
+
+// buildSelectorItem 将 InjectItem 转换为 inject.Item
+func buildSelectorItem(item InjectItem) inject.Item {
+	return inject.Item{
+		Selector: item.At,
+		Relation: inject.Relation(item.Relation),
+		Scope:    inject.Scope(item.Scope),
+		Content:  item.Content,
+		IsCSS:    item.ResourceType == ResourceTypeCSS,
+	}
+}
+
+// selectorResourceType 将 inject.Item.IsCSS 还原为 addon 资源类型
+func selectorResourceType(isCSS bool) ResourceType {
+	if isCSS {
+		return ResourceTypeCSS
+	}
+	return ResourceTypeJS
+}
+
+// injectByPosition 按文档级 position 分组并注入
+func injectByPosition(html []byte, injects []InjectItem) []byte {
 	if len(injects) == 0 {
 		return html
 	}

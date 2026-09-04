@@ -15,11 +15,13 @@ import (
 	"time"
 
 	"github.com/zrurf/cifera/internal/addon"
+	"github.com/zrurf/cifera/internal/apivhost"
 	"github.com/zrurf/cifera/internal/cache"
 	"github.com/zrurf/cifera/internal/compress"
 	"github.com/zrurf/cifera/internal/constant"
 	"github.com/zrurf/cifera/internal/cookiejar"
 	"github.com/zrurf/cifera/internal/rewriter"
+	"github.com/zrurf/cifera/internal/tenant"
 	"github.com/zrurf/cifera/internal/utils"
 	"github.com/zrurf/cifera/internal/vhost"
 	"github.com/zrurf/cifera/internal/wsproxy"
@@ -47,7 +49,9 @@ const (
 	cookieJarKey        ctxKey = "cookie_jar"
 	cookieSessionIDKey  ctxKey = "cookie_session_id"
 	cookieSessionNewKey ctxKey = "cookie_session_new"
+	cookieJarKeyCtx     ctxKey = "cookie_jar_key"
 	cookieSyncKeysKey   ctxKey = "cookie_sync_keys"
+	tenantCtxKey        ctxKey = "tenant"
 )
 
 // isRedirect 判断响应是否为重定向
@@ -83,17 +87,22 @@ func newOptimizedTransport() *http.Transport {
 
 // CreateServer 创建代理服务器
 // addons: 已加载的 addon；registry: 虚拟主机注册表
-// negotiator/cch/cookieMgr 可为 nil，分别表示不压缩、不缓存、不启用 Cookie Jar
-func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache, cookieMgr *cookiejar.Manager) http.Handler {
+// negotiator/cch/cookieMgr/tstore 可为 nil，分别表示不压缩、不缓存、不启用 Cookie Jar、不启用注册租户
+// apiHost 为内置 API vhost 的保留主机名，空表示不启用 API vhost
+func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache, cookieMgr *cookiejar.Manager, apiHost string, tstore *tenant.Store) http.Handler {
 	h := &ciferaHandler{
-		addons:     addons,
-		registry:   registry,
-		runtimeJS:  runtimeJS,
-		logger:     logger,
-		negotiator: negotiator,
-		cache:      cch,
-		cookieMgr:  cookieMgr,
-		sem:        make(chan struct{}, 4096), // 最多 4096 个并发代理请求
+		addons:      addons,
+		registry:    registry,
+		runtimeJS:   runtimeJS,
+		logger:      logger,
+		negotiator:  negotiator,
+		cache:       cch,
+		cookieMgr:   cookieMgr,
+		tenantRes:   tenant.NewResolver(tstore),
+		tenantStore: tstore,
+		apiHost:     apiHost,
+		apiVhost:    apivhost.New(cookieMgr, tstore, logger),
+		sem:         make(chan struct{}, 4096), // 最多 4096 个并发代理请求
 	}
 
 	transport := newOptimizedTransport()
@@ -164,8 +173,14 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 			if isNew, ok := r.In.Context().Value(cookieSessionNewKey).(bool); ok {
 				outCtx = context.WithValue(outCtx, cookieSessionNewKey, isNew)
 			}
+			if jarKey, ok := r.In.Context().Value(cookieJarKeyCtx).(string); ok {
+				outCtx = context.WithValue(outCtx, cookieJarKeyCtx, jarKey)
+			}
 			if keys, ok := r.In.Context().Value(cookieSyncKeysKey).([]string); ok {
 				outCtx = context.WithValue(outCtx, cookieSyncKeysKey, keys)
+			}
+			if t, ok := r.In.Context().Value(tenantCtxKey).(tenant.Tenant); ok {
+				outCtx = context.WithValue(outCtx, tenantCtxKey, t)
 			}
 			r.Out = r.Out.WithContext(outCtx)
 		},
@@ -227,14 +242,18 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 
 // ciferaHandler 整合 addon block 检查、虚拟主机分发和响应处理的 handler
 type ciferaHandler struct {
-	proxy      http.Handler
-	addons     []*addon.LoadedAddon
-	registry   *vhost.Registry
-	runtimeJS  string
-	logger     *zap.Logger
-	negotiator *compress.Negotiator
-	cache      *cache.Cache
-	cookieMgr  *cookiejar.Manager
+	proxy       http.Handler
+	addons      []*addon.LoadedAddon
+	registry    *vhost.Registry
+	runtimeJS   string
+	logger      *zap.Logger
+	negotiator  *compress.Negotiator
+	cache       *cache.Cache
+	cookieMgr   *cookiejar.Manager
+	tenantRes   *tenant.Resolver  // 租户解析器（注册租户 token 校验）
+	tenantStore *tenant.Store     // 注册租户配置（addon 参数 / enabled_addons），可为 nil
+	apiHost     string            // 内置 API vhost 保留主机名；空则不启用
+	apiVhost    *apivhost.Handler // 内置 API 处理器
 	// 并发控制信号量，限制同时处理的代理请求数
 	sem chan struct{}
 	// addonsMu 保护 addons 字段，支持热加载时的原子替换
@@ -255,6 +274,73 @@ func (h *ciferaHandler) ReplaceAddons(addons []*addon.LoadedAddon) {
 	h.addonsMu.Unlock()
 }
 
+// tenantInjectContext 解析当前租户的 addon 个性化上下文。
+// 返回注入匹配用的参数解析器与浏览器侧可见的 addon 参数表（addonID → {params:{...}}）。
+// 注册租户使用其 addon_params / enabled_addons 个性化；否则返回 nil（走全局参数）。
+// 返回的两个集合均为只读（构建后不再修改），可安全供并发匹配使用。
+func (h *ciferaHandler) tenantInjectContext(t tenant.Tenant) (addon.TenantParamResolver, map[string]any) {
+	if h.tenantStore == nil || t.ID == "" {
+		return nil, nil
+	}
+	reg, ok := h.tenantStore.Registration(t.ID)
+	if !ok {
+		return nil, nil
+	}
+
+	// enabled_addons 非空时，仅其在集合内的 addon 可用
+	enabled := make(map[string]bool, len(reg.EnabledAddons))
+	for _, id := range reg.EnabledAddons {
+		enabled[id] = true
+	}
+
+	// 单次遍历加载的 addon，预计算租户级参数与浏览器可见参数表。
+	// 这些映射构建完成后只读，避免并发匹配时写共享 map 造成竞态。
+	addons := h.loadAddons()
+	byID := make(map[string]*addon.LoadedAddon, len(addons))
+	for _, a := range addons {
+		byID[a.Manifest.Addon.ID] = a
+	}
+
+	// tenantParams 记录真正有租户级参数覆盖的 addon（用于按租户重渲染）；
+	// addonsParams 记录所有租户可用 addon 的浏览器可见参数（含全局默认）。
+	tenantParams := make(map[string]map[string]any)
+	addonsParams := make(map[string]any)
+
+	for id, a := range byID {
+		if len(enabled) > 0 && !enabled[id] {
+			continue // 租户未启用该 addon，不注入也不暴露
+		}
+		// 默认暴露全局参数
+		addonsParams[id] = map[string]any{"params": a.Params}
+		if overrides := reg.AddonParams[id]; len(overrides) > 0 {
+			p, err := a.ParamsFor(overrides)
+			if err != nil {
+				h.logger.Warn("租户 addon 参数解析失败，使用全局参数",
+					zap.String("tenant", t.ID),
+					zap.String("addon", id),
+					zap.Error(err),
+				)
+				continue
+			}
+			tenantParams[id] = p
+			addonsParams[id] = map[string]any{"params": p}
+		}
+	}
+
+	resolver := func(addonID string) (bool, string, map[string]any) {
+		if len(enabled) > 0 && !enabled[addonID] {
+			return false, "", nil
+		}
+		// 无租户级参数覆盖时返回 nil，使用全局渲染结果
+		if p, ok := tenantParams[addonID]; ok {
+			return true, t.ID, p
+		}
+		return true, "", nil
+	}
+
+	return resolver, addonsParams
+}
+
 // ServeHTTP 处理所有进入的请求
 func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 内置运维端点：不转发到上游
@@ -272,12 +358,34 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Cookie Jar 会话处理
 	if h.cookieMgr != nil && params.host != "" {
-		var sessionID string
+		// 客户端只持有 sid；租户另行经 _cifera_tid/_cifera_tok cookie 标识（见 tenant 包）
+		sessionID := ""
 		if c, err := r.Cookie(constant.CookieSessionID); err == nil {
-			sessionID = c.Value
+			if cookiejar.IsValidSessionID(c.Value) {
+				sessionID = c.Value
+			}
 		}
 
-		jar, sid, isNew := h.cookieMgr.GetOrCreateJar(sessionID)
+		// 解析租户
+		t, _ := h.tenantRes.Resolve(func(name string) string {
+			if c, err := r.Cookie(name); err == nil {
+				return c.Value
+			}
+			return ""
+		}, sessionID)
+
+		// 会话引导：无合法会话则生成新会话 ID；自动租户以会话作为租户 ID
+		if sessionID == "" {
+			newSID := cookiejar.NewSessionID()
+			if t.Mode == tenant.ModeAuto {
+				t.ID = newSID
+			}
+			sessionID = newSID
+		}
+
+		// 租户命名空间键隔离 jar
+		jarKey := t.JarKey(sessionID)
+		jar, isNew := h.cookieMgr.GetOrCreateJar(jarKey)
 
 		// 用 jar 中的 cookie 替换请求的 Cookie 头
 		jarCookies := jar.Cookies(params.host, r.URL.Path)
@@ -297,19 +405,41 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					cookieSyncKeys = append(cookieSyncKeys, c.Name+"|"+c.Path)
 				}
 				// 同步的 cookie 一并持久化
-				h.cookieMgr.PersistJar(sid, jar)
+				h.cookieMgr.PersistJar(jarKey, jar)
 			}
 		}
 
 		// 将 jar 信息存入 context，供 ModifyResponse 使用
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, cookieJarKey, jar)
-		ctx = context.WithValue(ctx, cookieSessionIDKey, sid)
+		ctx = context.WithValue(ctx, cookieSessionIDKey, sessionID)
 		ctx = context.WithValue(ctx, cookieSessionNewKey, isNew)
+		ctx = context.WithValue(ctx, cookieJarKeyCtx, jarKey)
+		ctx = context.WithValue(ctx, tenantCtxKey, t)
 		if len(cookieSyncKeys) > 0 {
 			ctx = context.WithValue(ctx, cookieSyncKeysKey, cookieSyncKeys)
 		}
 		r = r.WithContext(ctx)
+	}
+
+	// 内置 API vhost：命中保留主机名时直接由 API 处理器服务，永不转发
+	// 用忽略端口的比较：stripProxyPort 会保留代理端口（见该函数），而 apiHost 通常无端口
+	if h.apiHost != "" && h.apiVhost != nil && hostNameEquals(params.host, h.apiHost) {
+		rc := &apivhost.RequestContext{}
+		if jar, ok := r.Context().Value(cookieJarKey).(*cookiejar.Jar); ok {
+			rc.Jar = jar
+		}
+		if jk, ok := r.Context().Value(cookieJarKeyCtx).(string); ok {
+			rc.JarKey = jk
+		}
+		if sid, ok := r.Context().Value(cookieSessionIDKey).(string); ok {
+			rc.SessionID = sid
+		}
+		if t, ok := r.Context().Value(tenantCtxKey).(tenant.Tenant); ok {
+			rc.Tenant = t
+		}
+		h.apiVhost.ServeHTTP(w, r, rc)
+		return
 	}
 
 	// addon block 检查
@@ -410,6 +540,17 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
+// currentTenant 从响应关联请求的 context 中读取当前租户；
+// 未设置时返回空自动租户。
+func currentTenant(resp *http.Response) tenant.Tenant {
+	if resp != nil && resp.Request != nil {
+		if t, ok := resp.Request.Context().Value(tenantCtxKey).(tenant.Tenant); ok {
+			return t
+		}
+	}
+	return tenant.Tenant{}
+}
+
 // writeMetrics 输出进程内运行指标（当前仅含缓存统计）
 func (h *ciferaHandler) writeMetrics(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -464,13 +605,36 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 	// 原始 URL 用于 addon 匹配
 	originalURL := buildOriginalURL(params.schema, params.host, resp.Request.URL)
 
+	// 租户上下文：注册租户时用其 addon 参数个性化，否则走全局
+	resolver, addonsParams := h.tenantInjectContext(currentTenant(resp))
+
+	// tenantContent 返回规则在租户上下文下的渲染内容（无个性化时返回全局结果）。
+	// tenantAllowed 判断该 addon 是否被当前租户允许（enabled_addons 过滤；无解析器时恒为 true）。
+	tenantAllowed := func(addonID string) bool {
+		if resolver == nil {
+			return true
+		}
+		include, _, _ := resolver(addonID)
+		return include
+	}
+	tenantContent := func(rule *addon.Rule, addonID string) []byte {
+		if resolver == nil {
+			return rule.ResourceContent()
+		}
+		_, tenantID, params := resolver(addonID)
+		if params == nil {
+			return rule.ResourceContent()
+		}
+		return rule.ResourceContentFor(tenantID, params)
+	}
+
 	// addon replace 规则：替换后跳过中间处理步骤，但仍需压缩
 	isReplaced := false
-	if replaceResult := addon.MatchReplace(h.loadAddons(), originalURL); replaceResult != nil {
+	if replaceResult := addon.MatchReplace(h.loadAddons(), originalURL); replaceResult != nil && tenantAllowed(replaceResult.AddonID) {
 		switch replaceResult.Rule.Action {
 		case addon.ActionReplace:
 			// 替换整个响应（body + Content-Type）
-			body := replaceResult.Rule.ResourceContent()
+			body := tenantContent(replaceResult.Rule, replaceResult.AddonID)
 			resp.Body = &readCloser{bytes.NewReader(body)}
 			resp.ContentLength = int64(len(body))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
@@ -488,7 +652,7 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 
 		case addon.ActionReplaceContent:
 			// 仅替换响应体，保留原始响应头
-			body := replaceResult.Rule.ResourceContent()
+			body := tenantContent(replaceResult.Rule, replaceResult.AddonID)
 			resp.Body = &readCloser{bytes.NewReader(body)}
 			resp.ContentLength = int64(len(body))
 			resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
@@ -503,6 +667,7 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 	}
 
 	if !isReplaced {
+		injectItems := addon.MatchInjectFor(h.loadAddons(), originalURL, resolver)
 		// 重写重定向 Location
 		if isRedirect(resp.StatusCode) {
 			rewriteRedirectLocation(resp, params)
@@ -520,8 +685,8 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 					for _, c := range setCookies {
 						jar.AddCookie(c, params.host)
 					}
-					if sid, sidOk := resp.Request.Context().Value(cookieSessionIDKey).(string); sidOk {
-						h.cookieMgr.PersistJar(sid, jar)
+					if jarKey, jarKeyOk := resp.Request.Context().Value(cookieJarKeyCtx).(string); jarKeyOk {
+						h.cookieMgr.PersistJar(jarKey, jar)
 					}
 					// 通过 Cifera-Cookie-Push 头增量推送 Set-Cookie 变更（格式与 Cifera-Cookie-Sync 一致），客户端 JS 据此更新 Shadow Jar
 					resp.Header.Set(constant.HeaderCookiePush, buildCookiePushHeader(setCookies))
@@ -549,8 +714,6 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 		if keys, ok := resp.Request.Context().Value(cookieSyncKeysKey).([]string); ok && len(keys) > 0 {
 			resp.Header.Set(constant.HeaderCookieAck, strings.Join(keys, ","))
 		}
-
-		injectItems := addon.MatchInject(h.addons, originalURL)
 
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 		isHTML := strings.Contains(contentType, "text/html")
@@ -593,7 +756,7 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 					}
 				}
 			}
-			if err := rewriter.RewriteResponse(resp, h.runtimeJS, proxyBase, params.currentPath, params.host, params.schema, params.referer, cookiesJSON, injectItems, h.logger); err != nil {
+			if err := rewriter.RewriteResponse(resp, h.runtimeJS, proxyBase, params.currentPath, params.host, params.schema, params.referer, cookiesJSON, injectItems, addonsParams, h.logger); err != nil {
 				h.logger.Error("改写 HTML 响应失败",
 					zap.String("host", params.host),
 					zap.String("path", params.currentPath),
@@ -774,6 +937,25 @@ func buildOriginalURL(schema, host string, reqURL *url.URL) string {
 // 前端 JS 可能把代理端口拼进源站 host（如 "cn.bing.com:8080"）；
 // 仅当 host 尾部端口等于代理端口且 hostname 不是代理 hostname（或其子域）时剥离，
 // 否则端口可能是源站合法端口或代理 host 自身端口，需保留。
+
+// hostNameEquals 忽略端口比较两个主机（如 "api.cifera" 与 "api.cifera:8080" 视为相等）。
+func hostNameEquals(a, b string) bool {
+	ca, ccb := canonicalHostname(a), canonicalHostname(b)
+	return ca != "" && ca == ccb
+}
+
+// canonicalHostname 提取主机名（剥离端口）并小写化；无法解析端口时返回原始值的小写。
+func canonicalHostname(host string) string {
+	if host == "" {
+		return ""
+	}
+	h := strings.ToLower(strings.TrimSpace(host))
+	if hh, _, err := net.SplitHostPort(h); err == nil {
+		return hh
+	}
+	return h
+}
+
 func stripProxyPort(host, requestHost string, logger *zap.Logger) string {
 	if host == "" || requestHost == "" {
 		return host

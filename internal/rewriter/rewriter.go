@@ -14,7 +14,8 @@ import (
 // RewriteResponse 改写 HTML 响应中的静态 URL 并注入 JS 运行时
 // 仅处理 text/html 且内容含实际 HTML 结构的响应
 // 先注入 addon 内容，后注入运行时，保证运行时位于 <head> 后最前、addon JS 可调用其 API
-func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, cookiesJSON string, addonInjects []addon.InjectItem, logger *zap.Logger) error {
+// addonParams 为各 addon 在浏览器侧可见的参数表（addonID → {params:{...}}），nil 则不注入
+func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, host, schema, referer, cookiesJSON string, addonInjects []addon.InjectItem, addonParams map[string]any, logger *zap.Logger) error {
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if !strings.Contains(contentType, "text/html") {
 		return nil
@@ -55,7 +56,7 @@ func RewriteResponse(resp *http.Response, runtimeJS, proxyBase, currentPath, hos
 		rewritten = addon.InjectAddons(rewritten, addonInjects)
 	}
 
-	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, cookiesJSON)
+	rewritten = InjectRuntime(rewritten, runtimeJS, host, schema, referer, cookiesJSON, addonParams)
 
 	resp.Body = io.NopCloser(bytes.NewReader(rewritten))
 	resp.ContentLength = int64(len(rewritten))
