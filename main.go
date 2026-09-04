@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"github.com/zrurf/cifera/internal"
@@ -112,11 +117,49 @@ func main() {
 	}
 
 	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch, cookieMgr)
-	http.Handle("/", handler)
+
+	// addon 热加载：目录存在时监听变更并自动重新加载
+	if stat, err := os.Stat(config.Addons.Dir); err == nil && stat.IsDir() {
+		if reloader, ok := handler.(interface{ ReplaceAddons([]*addon.LoadedAddon) }); ok {
+			watchAddonsDir(config.Addons.Dir, config.Addons.Enabled, reloader.ReplaceAddons, logger)
+		}
+	}
+
+	// 慢请求防护：限制请求头读取时间与空闲连接保留时间
+	srv := &http.Server{
+		Addr:              config.Server.Listen,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// 监听退出信号，触发停机
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		var err error
+		if config.Server.TLSCert != "" && config.Server.TLSKey != "" {
+			err = srv.ListenAndServeTLS(config.Server.TLSCert, config.Server.TLSKey)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			logger.Fatal("服务启动失败", zap.Error(err))
+		}
+	}()
 
 	logger.Info("服务启动", zap.String("listen", config.Server.Listen))
-	if err := http.ListenAndServe(config.Server.Listen, nil); err != nil {
-		logger.Fatal("服务启动失败", zap.Error(err))
+	<-ctx.Done()
+	logger.Info("收到退出信号，正在停止服务")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("停机超时", zap.Error(err))
+	}
+	if cch != nil {
+		cch.Close()
 	}
 }
 
@@ -135,7 +178,9 @@ func initConfig(logger *zap.Logger) (*internal.Config, error) {
 
 	v.SetConfigFile(configFile)
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+		// 显式指定路径时 viper 对"文件不存在"返回 *os.PathError，
+		// 需用 os.IsNotExist 判断而不能依赖 viper.ConfigFileNotFoundError
+		if os.IsNotExist(err) {
 			logger.Info("未找到配置文件，将使用默认值和环境变量", zap.String("path", configFile))
 		} else {
 			// 配置文件存在但解析失败（如 TOML 语法错误），直接报错退出而非静默忽略
@@ -164,6 +209,10 @@ func initConfig(logger *zap.Logger) (*internal.Config, error) {
 
 // initFlag 定义命令行 flag
 func initFlag() {
+	// 幂等：重复初始化（如测试中多次调用）时不重复注册，避免 panic
+	if pflag.Lookup("config") != nil {
+		return
+	}
 	pflag.String("config", "./config.toml", "配置文件路径")
 	pflag.String("server.listen", ":80", "HTTP 监听地址")
 	pflag.String("log.path", "./log/server.log", "日志文件路径")
@@ -267,4 +316,80 @@ func initLog(baseLogger *zap.Logger, config internal.LogConfig) *zap.Logger {
 	zap.ReplaceGlobals(newLogger)
 
 	return newLogger
+}
+
+// watchAddonsDir 监听 addon 目录及其一级子目录，变更后防抖触发重载
+func watchAddonsDir(dir string, enabled []string, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		logger.Warn("初始化 addon 热加载失败", zap.Error(err))
+		return
+	}
+	defer w.Close()
+
+	if err := w.Add(dir); err != nil {
+		logger.Warn("监听 addon 目录失败", zap.String("dir", dir), zap.Error(err))
+		return
+	}
+	watchAddonsSubdirs(w, dir)
+	logger.Info("addon 热加载已启用", zap.String("dir", dir))
+
+	var mu sync.Mutex
+	var timer *time.Timer
+	// 防抖：多次变更合并为一次重载
+	poke := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if timer != nil {
+			return
+		}
+		timer = time.AfterFunc(500*time.Millisecond, func() {
+			mu.Lock()
+			timer = nil
+			mu.Unlock()
+			reloadAddons(dir, enabled, replace, logger)
+		})
+	}
+
+	for {
+		select {
+		case ev, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
+				_ = w.Add(ev.Name)
+			}
+			poke()
+		case err, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			logger.Debug("addon 目录监听异常", zap.Error(err))
+		}
+	}
+}
+
+// watchAddonsSubdirs 将 addon 目录下的一级子目录加入监听
+func watchAddonsSubdirs(w *fsnotify.Watcher, dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			_ = w.Add(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+// reloadAddons 重新加载 addon 并原子替换运行时列表
+func reloadAddons(dir string, enabled []string, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
+	addons, err := addon.LoadAddons(dir, enabled, logger)
+	if err != nil {
+		logger.Error("addon 热加载失败", zap.Error(err))
+		return
+	}
+	replace(addons)
+	logger.Info("addon 已热更新", zap.Int("count", len(addons)))
 }

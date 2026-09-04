@@ -5,15 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/nutsdb/nutsdb"
+	"github.com/dgraph-io/badger/v4"
 	"go.uber.org/zap"
 )
-
-const bucketName = "cookies"
 
 // uuidV4Regex 匹配 UUID v4 格式
 var uuidV4Regex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -37,7 +34,7 @@ func newUUID() string {
 type Config struct {
 	Enabled         bool
 	JarCapacity     int           // 每个 jar 最大 cookie 数，默认 500
-	PersistPath     string        // NutsDB 数据目录，为空则禁用持久化
+	PersistPath     string        // Badger 数据目录，为空则禁用持久化
 	CleanupInterval time.Duration // 清理间隔，默认 5 分钟
 }
 
@@ -51,17 +48,19 @@ type persistTask struct {
 type Manager struct {
 	mu              sync.RWMutex
 	jars            map[string]*Jar // key：会话 UUID
-	db              *nutsdb.DB      // NutsDB 持久化实例（禁用持久化时为 nil）
+	db              *badger.DB      // Badger 持久化实例（禁用持久化时为 nil）
 	logger          *zap.Logger
 	maxPerJar       int
 	cleanupInterval time.Duration
 	done            chan struct{}
+	// 跟踪后台 goroutine（persistWorker / cleanupLoop），Close 时等待其退出
+	wg sync.WaitGroup
 	// 异步持久化通道，缓冲足够大以避免阻塞
 	persistCh chan persistTask
 }
 
 // NewManager 创建 cookie jar 管理器；
-// cfg.PersistPath 非空时打开 NutsDB 并启用持久化。
+// cfg.PersistPath 非空时打开 Badger 并启用持久化。
 func NewManager(cfg Config, logger *zap.Logger) (*Manager, error) {
 	m := &Manager{
 		jars:            make(map[string]*Jar),
@@ -80,32 +79,19 @@ func NewManager(cfg Config, logger *zap.Logger) (*Manager, error) {
 	}
 
 	if cfg.PersistPath != "" {
-		opt := nutsdb.DefaultOptions
-		opt.Dir = cfg.PersistPath
-		opt.SyncEnable = false // 关闭同步写以提升性能，可容忍少量数据丢失
-
-		db, err := nutsdb.Open(opt)
+		db, err := badger.Open(badgerOptions(cfg.PersistPath))
 		if err != nil {
-			return nil, fmt.Errorf("failed to open NutsDB at %s: %w", cfg.PersistPath, err)
+			return nil, fmt.Errorf("打开 Badger 数据库失败 (%s): %w", cfg.PersistPath, err)
 		}
 		m.db = db
 
-		// 确保 bucket 存在（NutsDB v1.0.0+ 不再自动创建 bucket）
-		if err := m.db.Update(func(tx *nutsdb.Tx) error {
-			if err := tx.NewBucket(nutsdb.DataStructureBTree, bucketName); err != nil {
-				// bucket 已存在不是错误
-				if !strings.Contains(err.Error(), "already exist") {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			return nil, fmt.Errorf("failed to create NutsDB bucket: %w", err)
-		}
-
 		m.loadAllJars()
 
-		go m.persistWorker()
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.persistWorker()
+		}()
 
 		logger.Info("Cookie Jar 持久化已启用",
 			zap.String("path", cfg.PersistPath),
@@ -115,7 +101,16 @@ func NewManager(cfg Config, logger *zap.Logger) (*Manager, error) {
 	return m, nil
 }
 
-// persistWorker 从 persistCh 读取任务并写入 NutsDB，避免阻塞请求处理
+// badgerOptions 返回适用于小型 KV 存储的 Badger 配置。
+// cookie jar 数据量小，默认 1GB 的 value log 过大且占磁盘，这里调小以降低占用。
+func badgerOptions(dir string) badger.Options {
+	return badger.DefaultOptions(dir).
+		WithLogger(nil). // 关闭默认日志，避免向 stderr 输出大量信息
+		WithValueLogFileSize(64 << 20).
+		WithMemTableSize(8 << 20)
+}
+
+// persistWorker 从 persistCh 读取任务并写入 Badger，避免阻塞请求处理
 func (m *Manager) persistWorker() {
 	for {
 		select {
@@ -132,7 +127,7 @@ func (m *Manager) persistWorker() {
 	}
 }
 
-// writeJarToDB 将 cookie entries 写入 NutsDB（仅由 persistWorker 调用）
+// writeJarToDB 将 cookie entries 写入 Badger（仅由持久化相关 goroutine 调用）
 func (m *Manager) writeJarToDB(sessionID string, entries []CookieEntry) {
 	if m.db == nil {
 		return
@@ -152,8 +147,8 @@ func (m *Manager) writeJarToDB(sessionID string, entries []CookieEntry) {
 		return
 	}
 
-	if err := m.db.Update(func(tx *nutsdb.Tx) error {
-		return tx.Put(bucketName, []byte(sessionID), data, 0)
+	if err := m.db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(sessionID), data)
 	}); err != nil {
 		m.logger.Error("持久化 cookie jar 失败",
 			zap.String("session", sessionID),
@@ -193,7 +188,7 @@ func (m *Manager) GetOrCreateJar(sessionID string) (*Jar, string, bool) {
 	return jar, sessionID, true
 }
 
-// PersistJar 异步持久化 jar 到 NutsDB。
+// PersistJar 异步持久化 jar 到 Badger。
 // 提取 cookie entries 后发送到持久化通道，不阻塞调用方。
 // 如果通道满则丢弃本次持久化（下次会重试）。
 func (m *Manager) PersistJar(sessionID string, jar *Jar) {
@@ -214,12 +209,18 @@ func (m *Manager) PersistJar(sessionID string, jar *Jar) {
 
 // StartCleanup 启动定期清理 goroutine
 func (m *Manager) StartCleanup() {
-	go m.cleanupLoop()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.cleanupLoop()
+	}()
 }
 
-// Close 停止清理 goroutine 并关闭 NutsDB
+// Close 停止后台 goroutine 并关闭 Badger。
+// 通知 persistWorker/cleanupLoop 退出并等待其收尾，避免并发写入已关闭的数据库。
 func (m *Manager) Close() {
 	close(m.done)
+	m.wg.Wait()
 	if m.db != nil {
 		m.db.Close()
 	}
@@ -241,91 +242,97 @@ func (m *Manager) cleanupLoop() {
 }
 
 // cleanup 清理所有 jar 中的过期 cookie，并移除全部过期的 jar
+// 内存淘汰在锁内完成，DB 写入在锁外进行，避免慢 IO 阻塞会话请求
 func (m *Manager) cleanup() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	survivors := make(map[string]*Jar, len(m.jars))
 	var expiredSessions []string
 
+	m.mu.Lock()
 	for sessionID, jar := range m.jars {
 		jar.RemoveExpired()
-
 		if jar.IsExpired() {
 			expiredSessions = append(expiredSessions, sessionID)
+			continue
 		}
+		survivors[sessionID] = jar
 	}
-
 	for _, sessionID := range expiredSessions {
 		delete(m.jars, sessionID)
-		if m.db != nil {
-			m.deleteFromDB(sessionID)
-		}
 		m.logger.Debug("清理过期 cookie jar",
 			zap.String("session", sessionID),
 		)
 	}
+	m.mu.Unlock()
 
-	// 同步持久化存活的 jars（cleanup 在后台运行，可阻塞写库）
-	if m.db != nil {
-		for sessionID, jar := range m.jars {
-			entries := jar.AllCookies()
-			m.writeJarToDB(sessionID, entries)
-		}
+	if m.db == nil {
+		return
+	}
+
+	for _, sessionID := range expiredSessions {
+		m.deleteFromDB(sessionID)
+	}
+	for sessionID, jar := range survivors {
+		entries := jar.AllCookies()
+		m.writeJarToDB(sessionID, entries)
 	}
 }
 
-// loadAllJars 启动时从 NutsDB 加载所有已持久化的 jar
+// loadAllJars 启动时从 Badger 加载所有已持久化的 jar（单次遍历读取）
 func (m *Manager) loadAllJars() {
 	if m.db == nil {
 		return
 	}
 
-	var keys [][]byte
-	if err := m.db.View(func(tx *nutsdb.Tx) error {
-		ks, _, err := tx.GetAll(bucketName)
-		if err != nil {
-			// Bucket 可能尚未存在（首次运行）
-			if err == nutsdb.ErrBucketNotFound || strings.Contains(err.Error(), "bucket not found") {
-				return nil
+	if err := m.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			sessionID := string(item.Key())
+			data, err := item.ValueCopy(nil)
+			if err != nil {
+				m.logger.Debug("读取持久化 cookie jar 失败",
+					zap.String("session", sessionID),
+					zap.Error(err),
+				)
+				continue
 			}
-			return err
+			jar := restoreJar(data, m.maxPerJar, m.logger, sessionID)
+			if jar != nil {
+				m.jars[sessionID] = jar
+			}
 		}
-		keys = ks
 		return nil
 	}); err != nil {
-		m.logger.Error("从 NutsDB 加载 cookie jar 列表失败", zap.Error(err))
+		m.logger.Error("从 Badger 加载 cookie jar 失败", zap.Error(err))
 		return
 	}
 
-	for _, key := range keys {
-		sessionID := string(key)
-		if jar := m.loadJar(sessionID); jar != nil {
-			m.jars[sessionID] = jar
-		}
-	}
-
-	m.logger.Info("从 NutsDB 加载 cookie jar 完成",
+	m.logger.Info("从 Badger 加载 cookie jar 完成",
 		zap.Int("count", len(m.jars)),
 	)
 }
 
-// loadJar 从 NutsDB 加载单个 jar
+// loadJar 从 Badger 加载单个 jar
 func (m *Manager) loadJar(sessionID string) *Jar {
 	if m.db == nil {
 		return nil
 	}
 
 	var data []byte
-	if err := m.db.View(func(tx *nutsdb.Tx) error {
-		val, err := tx.Get(bucketName, []byte(sessionID))
+	err := m.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get([]byte(sessionID))
 		if err != nil {
 			return err
 		}
-		data = val
-		return nil
-	}); err != nil {
-		if err != nutsdb.ErrKeyNotFound && !strings.Contains(err.Error(), "key not found") {
-			m.logger.Debug("从 NutsDB 加载 cookie jar 失败",
+		data, err = item.ValueCopy(nil)
+		return err
+	})
+	if err != nil {
+		// 键不存在属正常情况，不记录
+		if err != badger.ErrKeyNotFound {
+			m.logger.Debug("从 Badger 加载 cookie jar 失败",
 				zap.String("session", sessionID),
 				zap.Error(err),
 			)
@@ -333,35 +340,37 @@ func (m *Manager) loadJar(sessionID string) *Jar {
 		return nil
 	}
 
+	return restoreJar(data, m.maxPerJar, m.logger, sessionID)
+}
+
+// restoreJar 将序列化数据反序列化为 jar
+func restoreJar(data []byte, maxPerJar int, logger *zap.Logger, sessionID string) *Jar {
 	var entries []CookieEntry
 	if err := json.Unmarshal(data, &entries); err != nil {
-		m.logger.Error("反序列化 cookie jar 失败",
+		logger.Error("反序列化 cookie jar 失败",
 			zap.String("session", sessionID),
 			zap.Error(err),
 		)
 		return nil
 	}
 
-	jar := NewJar(m.maxPerJar)
+	jar := NewJar(maxPerJar)
 	jar.RestoreCookies(entries)
 	return jar
 }
 
-// deleteFromDB 从 NutsDB 删除一个 jar
+// deleteFromDB 从 Badger 删除一个 jar
 func (m *Manager) deleteFromDB(sessionID string) {
 	if m.db == nil {
 		return
 	}
 
-	if err := m.db.Update(func(tx *nutsdb.Tx) error {
-		return tx.Delete(bucketName, []byte(sessionID))
+	if err := m.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete([]byte(sessionID))
 	}); err != nil {
-		// 忽略 key/bucket 不存在的错误
-		if err != nutsdb.ErrKeyNotFound && !strings.Contains(err.Error(), "not found") {
-			m.logger.Error("从 NutsDB 删除 cookie jar 失败",
-				zap.String("session", sessionID),
-				zap.Error(err),
-			)
-		}
+		m.logger.Error("从 Badger 删除 cookie jar 失败",
+			zap.String("session", sessionID),
+			zap.Error(err),
+		)
 	}
 }

@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -24,6 +25,9 @@ import (
 	"github.com/zrurf/cifera/internal/wsproxy"
 	"go.uber.org/zap"
 )
+
+// semMaxWait 并发槽位最大等待时长，超过则返回 503，避免请求无限排队
+const semMaxWait = 5 * time.Second
 
 // proxyParams 存储在 outbound request context 中的代理参数
 type proxyParams struct {
@@ -233,12 +237,37 @@ type ciferaHandler struct {
 	cookieMgr  *cookiejar.Manager
 	// 并发控制信号量，限制同时处理的代理请求数
 	sem chan struct{}
-	// addon 规则匹配结果缓存（正则匹配开销大，短生命周期缓存减少重复计算）
-	addonMatchCache sync.Map
+	// addonsMu 保护 addons 字段，支持热加载时的原子替换
+	addonsMu sync.RWMutex
+}
+
+// loadAddons 返回当前 addon 列表（读锁保护）
+func (h *ciferaHandler) loadAddons() []*addon.LoadedAddon {
+	h.addonsMu.RLock()
+	defer h.addonsMu.RUnlock()
+	return h.addons
+}
+
+// ReplaceAddons 原子替换 addon 列表（供热加载使用）
+func (h *ciferaHandler) ReplaceAddons(addons []*addon.LoadedAddon) {
+	h.addonsMu.Lock()
+	h.addons = addons
+	h.addonsMu.Unlock()
 }
 
 // ServeHTTP 处理所有进入的请求
 func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 内置运维端点：不转发到上游
+	switch r.URL.Path {
+	case "/healthz":
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "ok\n")
+		return
+	case "/metrics":
+		h.writeMetrics(w)
+		return
+	}
+
 	params := parseProxyParams(r, h.logger)
 
 	// Cookie Jar 会话处理
@@ -347,7 +376,7 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 缓存查找：仅对 GET/HEAD 请求检查缓存
 	if h.cache != nil && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
 		cacheKey := cache.BuildCacheKey(params.schema, params.host, r.URL.RequestURI())
-		if cachedResp, ok := h.cache.Get(cacheKey); ok {
+		if cachedResp, ok := h.cache.Get(cacheKey, r); ok {
 			h.logger.Debug("缓存命中",
 				zap.String("key", cacheKey),
 			)
@@ -359,7 +388,7 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 将 params 存入 context，供 Rewrite 使用
 	ctx = context.WithValue(ctx, proxyParamsKey, params)
 
-	// 并发控制：阻塞排队等待槽位而非拒绝；客户端断开时经 context 取消，避免泄漏
+	// 并发控制：抢占槽位并设置等待上限，避免高负载下请求无限排队
 	select {
 	case h.sem <- struct{}{}:
 		defer func() { <-h.sem }()
@@ -369,9 +398,28 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			zap.Error(ctx.Err()),
 		)
 		return
+	case <-time.After(semMaxWait):
+		h.logger.Warn("并发槽位等待超时，返回 503",
+			zap.String("path", r.URL.Path),
+			zap.Duration("wait", semMaxWait),
+		)
+		http.Error(w, "Server busy", http.StatusServiceUnavailable)
+		return
 	}
 
 	h.proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// writeMetrics 输出进程内运行指标（当前仅含缓存统计）
+func (h *ciferaHandler) writeMetrics(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	var sb strings.Builder
+	if h.cache != nil {
+		hits, misses, size, count := h.cache.Stats()
+		fmt.Fprintf(&sb, "cache_hits_total %d\ncache_misses_total %d\ncache_size_bytes %d\ncache_entries %d\n",
+			hits, misses, size, count)
+	}
+	io.WriteString(w, sb.String())
 }
 
 // serveOverride 用 override vhost 服务请求
@@ -418,7 +466,7 @@ func (h *ciferaHandler) processResponse(resp *http.Response, params *proxyParams
 
 	// addon replace 规则：替换后跳过中间处理步骤，但仍需压缩
 	isReplaced := false
-	if replaceResult := addon.MatchReplace(h.addons, originalURL); replaceResult != nil {
+	if replaceResult := addon.MatchReplace(h.loadAddons(), originalURL); replaceResult != nil {
 		switch replaceResult.Rule.Action {
 		case addon.ActionReplace:
 			// 替换整个响应（body + Content-Type）

@@ -1,5 +1,7 @@
 [server]
 listen = ":8080"            # 监听地址
+# tls_cert = "./cert.pem"   # HTTPS 证书文件（与 tls_key 同时配置时启用 HTTPS 监听）
+# tls_key = "./key.pem"     # HTTPS 私钥文件
 
 [log]
 level = "info"              # 日志级别，debug, info, warn, error, fatal
@@ -39,7 +41,7 @@ max_size = 268435456        # 最大缓存大小（字节），默认 256MB
 [cookies]
 enabled = true               # 是否启用 Cookie Jar（服务端 Cookie 管理）
 jar_capacity = 500           # 每个会话最大 Cookie 数量
-persist_path = "./.data/cookies"  # NutsDB 持久化目录（空则不持久化）
+persist_path = "./.data/cookies"  # Badger 持久化目录（空则不持久化）
 cleanup_interval = 300       # 过期 Cookie 清理间隔（秒）
 
 ## 虚拟主机配置

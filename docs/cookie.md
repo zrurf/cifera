@@ -6,7 +6,7 @@ Cifera 实现了服务器端 Cookie 托管系统，完全替代浏览器原生 C
 
 - **隔离**：源站 Cookie 不接触浏览器，避免跨站 Cookie 污染和泄露
 - **托管**：Cifera 服务器为每个用户维护独立的 Cookie Jar，通过会话 ID 关联
-- **持久化**：Cookie Jar 可持久化到磁盘（NutsDB），重启后恢复
+- **持久化**：Cookie Jar 可持久化到磁盘（Badger），重启后恢复
 - **JS 兼容**：通过 hook `document.cookie` 读写，JS 代码无感知
 
 ## 架构
@@ -16,7 +16,7 @@ Cifera 实现了服务器端 Cookie 托管系统，完全替代浏览器原生 C
 ┌──────────────────┐         ┌───────────────────────────┐         ┌──────────┐
 │ document.cookie  │         │  Session ID → Cookie Jar  │         │          │
 │   ↕ hook         │         │       ↕ AddCookie         │         │          │
-│ Shadow Jar       │  sync   │  In-memory + NutsDB       │  proxy  │ Set-Cookie│
+│ Shadow Jar       │  sync   │  In-memory + Badger       │  proxy  │ Set-Cookie│
 │ (JS Object)      │────────▶│                           │────────▶│          │
 │ dirty flag       │  ACK    │  stripProxyPort           │◀────────│          │
 └──────────────────┘         └───────────────────────────┘         └──────────┘
@@ -106,7 +106,7 @@ Cifera-Cookie-Ack: session|/,token|/api
 [cookies]
 enabled = true                  # 是否启用 Cookie 托管
 jar_capacity = 500              # 每个 Jar 最大 cookie 数量
-persist_path = "./data/cookies" # NutsDB 持久化目录（空则不持久化）
+persist_path = "./data/cookies" # Badger 持久化目录（空则不持久化）
 cleanup_interval = 300          # 过期清理间隔（秒）
 ```
 
@@ -116,12 +116,12 @@ cleanup_interval = 300          # 过期清理间隔（秒）
 |--------|------|--------|------|
 | `enabled` | bool | `true` | 启用 Cookie 托管系统 |
 | `jar_capacity` | int | `500` | 每个 Jar 最大 cookie 数，超出时淘汰最早过期的 |
-| `persist_path` | string | `""` | NutsDB 数据目录，为空则仅内存存储 |
+| `persist_path` | string | `""` | Badger 数据目录，为空则仅内存存储 |
 | `cleanup_interval` | int | `300` | 定期清理间隔（秒），移除过期 cookie 和空 Jar |
 
 ## 持久化
 
-- 使用 [NutsDB](https://github.com/nutsdb/nutsdb)（BTree + MMAP）作为持久化引擎
+- 使用 [BadgerDB](https://github.com/dgraph-io/badger)（LSM + WAL）作为持久化引擎
 - 每个 Cookie Jar 以 session ID 为 key，序列化的 `[]CookieEntry` 为 value
 - 写入通过异步通道（缓冲 4096），不阻塞请求处理
 - 通道满时丢弃本次写入（cleanup 定期兜底）

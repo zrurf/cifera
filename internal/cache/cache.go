@@ -37,13 +37,15 @@ type cacheWriteRequest struct {
 
 // entry 缓存条目
 type entry struct {
-	key        string
-	header     http.Header
-	body       []byte
-	statusCode int
-	storedAt   time.Time
-	ttl        time.Duration
-	size       int64
+	key          string
+	header       http.Header
+	body         []byte
+	statusCode   int
+	storedAt     time.Time
+	ttl          time.Duration
+	size         int64
+	etag         string    // 响应验证器，用于条件请求
+	lastModified time.Time // 响应修改时间，用于 If-Modified-Since
 }
 
 // Cache 内存 LRU 缓存
@@ -99,8 +101,8 @@ func (c *Cache) Close() {
 	<-c.done
 }
 
-// Get 从缓存中获取条目
-func (c *Cache) Get(key string) (*http.Response, bool) {
+// Get 从缓存中获取条目；req 携带条件请求头时，验证通过则返回 304
+func (c *Cache) Get(key string, req *http.Request) (*http.Response, bool) {
 	c.mu.Lock()
 	elem, ok := c.items[key]
 	if !ok {
@@ -123,12 +125,55 @@ func (c *Cache) Get(key string) (*http.Response, bool) {
 
 	c.hits.Add(1)
 
+	// 条件请求命中：返回 304 而不携带 body
+	if isNotModified(req, e) {
+		resp := &http.Response{
+			StatusCode:    http.StatusNotModified,
+			Header:        http.Header{},
+			Body:          http.NoBody,
+			ContentLength: 0,
+		}
+		// 回带验证器，便于客户端后续再次条件请求
+		if e.etag != "" {
+			resp.Header.Set("ETag", e.etag)
+		}
+		if !e.lastModified.IsZero() {
+			resp.Header.Set("Last-Modified", e.lastModified.UTC().Format(http.TimeFormat))
+		}
+		if cctl := e.header.Get("Cache-Control"); cctl != "" {
+			resp.Header.Set("Cache-Control", cctl)
+		}
+		return resp, true
+	}
+
 	resp := &http.Response{
 		StatusCode: e.statusCode,
 		Header:     e.header.Clone(),
 		Body:       newBytesReadCloser(e.body),
 	}
 	return resp, true
+}
+
+// isNotModified 判断缓存条目是否满足条件请求
+func isNotModified(req *http.Request, e *entry) bool {
+	if req == nil {
+		return false
+	}
+	if inm := strings.TrimSpace(req.Header.Get("If-None-Match")); inm != "" {
+		if inm == "*" {
+			return true
+		}
+		if e.etag != "" {
+			// 忽略弱验证器 W/ 前缀后按值比较
+			return strings.TrimPrefix(inm, "W/") == strings.TrimPrefix(e.etag, "W/")
+		}
+	}
+	if ims := req.Header.Get("If-Modified-Since"); ims != "" && !e.lastModified.IsZero() {
+		if t, err := http.ParseTime(ims); err == nil && !e.lastModified.After(t) {
+			return true
+		}
+	}
+	return false
 }
 
 // SetAsync 异步存储条目，不阻塞调用者（写入由后台 goroutine 执行）
@@ -186,14 +231,25 @@ func (c *Cache) setLocked(key string, header http.Header, body []byte, statusCod
 		}
 	}
 
+	// 供条件请求使用的验证器
+	etag := header.Get("ETag")
+	var lastModified time.Time
+	if lm := header.Get("Last-Modified"); lm != "" {
+		if t, err := http.ParseTime(lm); err == nil {
+			lastModified = t
+		}
+	}
+
 	e := &entry{
-		key:        key,
-		header:     header,
-		body:       body,
-		statusCode: statusCode,
-		storedAt:   time.Now(),
-		ttl:        ttl,
-		size:       entrySize,
+		key:          key,
+		header:       header,
+		body:         body,
+		statusCode:   statusCode,
+		storedAt:     time.Now(),
+		ttl:          ttl,
+		size:         entrySize,
+		etag:         etag,
+		lastModified: lastModified,
 	}
 
 	elem := c.lru.PushFront(e)
@@ -243,8 +299,8 @@ func BuildCacheKey(schema, host string, reqURL string) string {
 
 // IsCacheable 判断响应是否可缓存
 func IsCacheable(resp *http.Response, r *http.Request) bool {
-	// 仅缓存 GET/HEAD
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+	// 仅缓存 GET：HEAD 响应体为空，写入会污染缓存（读取时 GET 仍可命中）
+	if r.Method != http.MethodGet {
 		return false
 	}
 

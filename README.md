@@ -5,7 +5,7 @@
 - **JS 运行时注入**：自动向 HTML 页面注入 Cifera 的 TS 编译运行时，拦截并改写页面内的 fetch、XHR、DOM、导航、Worker 等请求
 - **Addon 系统**：通过 addon.toml 配置规则，支持 replace（替换响应）、replace_content（替换响应体）、block（拦截请求）、inject（注入 JS/CSS）四种动作，无需修改代码
 - **虚拟主机**：支持本地目录托管和远程代理两种类型，override/fallback 优先级策略，元信息可透传（`pass_meta`）
-- **Cookie 托管**：服务器端 Cookie Jar 隔离源站 Cookie，避免跨站污染和泄露；支持 NutsDB 持久化、JS `document.cookie` 兼容、增量同步 + ACK 确认
+- **Cookie 托管**：服务器端 Cookie Jar 隔离源站 Cookie，避免跨站污染和泄露；支持 Badger 持久化、JS `document.cookie` 兼容、增量同步 + ACK 确认
 - **响应压缩**：gzip / brotli / zstd，HTML 解压→改写→再压缩，非 HTML 透传上游压缩
 - **缓存**：LRU 缓存，可配置容量
 - **元信息设计**：`_cifera_*` 参数和 `Cifera-*` 头受控流通，转发源站时自动剔除，不泄漏
@@ -73,7 +73,7 @@ max_size = 268435456        # 最大缓存大小（字节），默认 256MB
 [cookies]
 enabled = true              # 是否启用 Cookie 托管
 jar_capacity = 500          # 每个会话最大 Cookie 数量
-persist_path = "./data/cookies"  # NutsDB 持久化目录（空则不持久化）
+persist_path = "./data/cookies"  # Badger 持久化目录（空则不持久化）
 cleanup_interval = 300      # 过期 Cookie 清理间隔（秒）
 
 # [[hosts]]                 # 虚拟主机配置（可定义多个）

@@ -81,7 +81,7 @@ Cifera 是一个基于 Go 的正向 Web 代理服务器，核心思路是将源�
 ### `internal/cookiejar/` — Cookie 托管
 
 - `jar.go`：Cookie Jar 实现（RFC 6265 域名/路径匹配、容量淘汰、过期处理）
-- `manager.go`：Manager（UUID v4 会话、NutsDB 持久化、异步写入、定期清理）
+- `manager.go`：Manager（UUID v4 会话、Badger 持久化、异步写入、定期清理）
 - `matcher.go`：域名匹配、路径匹配、IP 检测
 
 详见 [Cookie 托管系统](cookie.md)
@@ -231,4 +231,4 @@ Cifera 的元信息（`_cifera_*` 参数 + `Cifera-*` header）用于 Cifera 与
 | VHost 本地目录不存在 | 启动时校验失败，config/addon 加载错误 |
 | VHost 路径穿越 | 运行时 `sanitizePath` 校验，非法路径返回 403 |
 | Cookie 持久化通道满 | 丢弃本次持久化（cleanup 定期兜底） |
-| NutsDB 启动失败 | 返回错误，服务器不启动 |
+| Badger 启动失败 | 返回错误，服务器不启动 |

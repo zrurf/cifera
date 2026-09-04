@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      # go build 依赖 embed 的 scripts/dist/cifera.runtime.js（未提交到仓库），须先构建
+      - name: 构建前端运行时
+        working-directory: scripts
+        run: bun install --frozen-lockfile && bun run build
+
+      - name: 前端类型检查
+        working-directory: scripts
+        run: bun run typecheck
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 编译检查
+        run: go build ./...
+
+      - name: 静态检查
+        run: go vet ./...
+
+      - name: 单元测试
+        run: go test ./... -race

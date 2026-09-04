@@ -168,7 +168,7 @@ func (j *Jar) Cookies(host, path string) []*http.Cookie {
 	defer j.mu.RUnlock()
 
 	host = strings.ToLower(host)
-	var result []*http.Cookie
+	var matched []*CookieEntry
 
 	for domain, m := range j.cookies {
 		if !domainMatch(host, domain) {
@@ -190,26 +190,31 @@ func (j *Jar) Cookies(host, path string) []*http.Cookie {
 			}
 
 			// 不校验 Secure cookie 的 HTTPS 限制：代理自身可能为 http，而源站为 https
-			result = append(result, &http.Cookie{
-				Name:     entry.Name,
-				Value:    entry.Value,
-				Path:     entry.Path,
-				Domain:   entry.Domain,
-				Expires:  entry.Expires,
-				Secure:   entry.Secure,
-				HttpOnly: entry.HttpOnly,
-				SameSite: http.SameSite(entry.SameSite),
-			})
+			matched = append(matched, entry)
 		}
 	}
 
-	// 按 path 长度降序（等长保持原顺序）
-	sort.SliceStable(result, func(i, j int) bool {
-		if len(result[i].Path) != len(result[j].Path) {
-			return len(result[i].Path) > len(result[j].Path)
+	// 按 RFC 6265 排序：path 长度降序，同 path 按创建时间升序（早的优先）
+	sort.SliceStable(matched, func(i, j int) bool {
+		if len(matched[i].Path) != len(matched[j].Path) {
+			return len(matched[i].Path) > len(matched[j].Path)
 		}
-		return false
+		return matched[i].Created.Before(matched[j].Created)
 	})
+
+	result := make([]*http.Cookie, 0, len(matched))
+	for _, entry := range matched {
+		result = append(result, &http.Cookie{
+			Name:     entry.Name,
+			Value:    entry.Value,
+			Path:     entry.Path,
+			Domain:   entry.Domain,
+			Expires:  entry.Expires,
+			Secure:   entry.Secure,
+			HttpOnly: entry.HttpOnly,
+			SameSite: http.SameSite(entry.SameSite),
+		})
+	}
 
 	return result
 }

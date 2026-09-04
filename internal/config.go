@@ -16,9 +16,11 @@ type Config struct {
 	Cookies     CookiesConfig      `mapstructure:"cookies"`
 }
 
-// ServerConfig HTTP服务的监听配置
+// ServerConfig HTTP 服务监听配置
 type ServerConfig struct {
-	Listen string `mapstructure:"listen"`
+	Listen  string `mapstructure:"listen"`
+	TLSCert string `mapstructure:"tls_cert"` // HTTPS 证书文件路径，与 tls_key 同时配置时启用 TLS
+	TLSKey  string `mapstructure:"tls_key"`  // HTTPS 私钥文件路径
 }
 
 // LogConfig 日志相关配置
@@ -68,6 +70,6 @@ type CacheConfig struct {
 type CookiesConfig struct {
 	Enabled         bool   `mapstructure:"enabled"`
 	JarCapacity     int    `mapstructure:"jar_capacity"`     // 每个 jar 最大 cookie 数量，默认 500
-	PersistPath     string `mapstructure:"persist_path"`     // NutsDB 数据目录，空则不持久化
+	PersistPath     string `mapstructure:"persist_path"`     // Badger 数据目录，空则不持久化
 	CleanupInterval int    `mapstructure:"cleanup_interval"` // 清理间隔（秒），默认 300
 }

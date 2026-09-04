@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"time"
 )
 
 // 代理参数常量（避免引入 constant 包依赖）
@@ -13,8 +14,21 @@ const (
 	metaHeaderPrefix = "Cifera-"
 )
 
+// proxyTransport remote vhost 复用共享 Transport。
+// 默认的 http.DefaultTransport 无超时与连接池上限，不适合代理场景。
+var proxyTransport = &http.Transport{
+	MaxIdleConns:          500,
+	MaxIdleConnsPerHost:   100,
+	IdleConnTimeout:       90 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ForceAttemptHTTP2:     true,
+	// 禁用自动解压：压缩响应交由代理出口统一处理
+	DisableCompression: true,
+}
+
 // serveRemote 代理到远程 URL
-// 使用 http.DefaultTransport.RoundTrip 发起请求，保留原始请求方法和 body
 func (h *Host) serveRemote(r *http.Request) (*http.Response, error) {
 	targetURL, err := h.buildRemoteURL(r)
 	if err != nil {
@@ -43,7 +57,7 @@ func (h *Host) serveRemote(r *http.Request) (*http.Response, error) {
 
 	req.Host = targetURL.Host
 
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	resp, err := proxyTransport.RoundTrip(req)
 	if err != nil {
 		return makeErrorResponse(http.StatusBadGateway, "Remote fetch failed"), nil
 	}

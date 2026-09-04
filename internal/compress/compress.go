@@ -5,6 +5,7 @@ package compress
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -14,6 +15,35 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 )
+
+// minCompressSize 小于该字节数的响应不压缩：收益有限且可能反而更大
+const minCompressSize = 1400
+
+// incompressiblePrefixes 明显不可压缩的 Content-Type 前缀，直接跳过压缩以节省 CPU
+var incompressiblePrefixes = []string{
+	"image/",
+	"video/",
+	"audio/",
+	"font/",
+	"application/zip",
+	"application/gzip",
+	"application/x-gzip",
+	"application/pdf",
+	"application/x-7z-compressed",
+	"application/x-rar-compressed",
+	"application/x-bzip2",
+}
+
+// isCompressibleType 判断 Content-Type 是否值得压缩
+func isCompressibleType(contentType string) bool {
+	ct := strings.ToLower(contentType)
+	for _, p := range incompressiblePrefixes {
+		if strings.HasPrefix(ct, p) {
+			return false
+		}
+	}
+	return true
+}
 
 // Algorithm 压缩算法类型
 type Algorithm string
@@ -327,15 +357,14 @@ func (n *Negotiator) compressZstd(body []byte) ([]byte, error) {
 	return result, nil
 }
 
-// CompressResponse 压缩 HTTP 响应体
-// 根据原始请求的 Accept-Encoding 选择最佳算法
-// 不会压缩已有 Content-Encoding 的响应
+// CompressResponse 按 Accept-Encoding 流式压缩响应体
+// 已压缩、长度已知过小或明显不可压缩的内容类型会跳过
 func (n *Negotiator) CompressResponse(resp *http.Response, origReq *http.Request) error {
 	if !n.enabled {
 		return nil
 	}
 
-	// 已有 Content-Encoding（如上游已压缩透传），跳过
+	// 已有 Content-Encoding（如上游压缩透传），跳过
 	if resp.Header.Get("Content-Encoding") != "" {
 		return nil
 	}
@@ -344,46 +373,101 @@ func (n *Negotiator) CompressResponse(resp *http.Response, origReq *http.Request
 		return nil
 	}
 
-	acceptEncoding := origReq.Header.Get("Accept-Encoding")
-	algo := n.Negotiate(acceptEncoding)
+	// 明显不可压缩的内容类型直接透传，节省压缩 CPU
+	if !isCompressibleType(resp.Header.Get("Content-Type")) {
+		return nil
+	}
+
+	algo := n.Negotiate(origReq.Header.Get("Accept-Encoding"))
 	if algo == "" {
 		return nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-
-	// 小于 1400 字节不压缩：收益有限且可能反而更大
-	if len(body) < 1400 {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
+	// 长度已知且过小：不压缩
+	if resp.ContentLength >= 0 && resp.ContentLength < minCompressSize {
 		return nil
 	}
 
-	compressed, err := n.Compress(body, algo)
-	if err != nil {
-		// 压缩失败，回退为原始响应
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		return err
-	}
-
-	// 压缩后更大则不使用压缩
-	if len(compressed) >= len(body) {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		return nil
-	}
-
-	resp.Body = io.NopCloser(bytes.NewReader(compressed))
-	resp.ContentLength = int64(len(compressed))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(compressed)))
+	// 流式压缩：边读上游边输出到客户端，避免整包缓冲。
+	// 长度未知（chunked）时无法预判压缩前后大小，不再做"压缩后更大则回退"的判断，
+	// 由上方不可压缩类型与小体积过滤兜底。
+	src := resp.Body
+	pr, pw := io.Pipe()
+	resp.Body = pr
+	resp.ContentLength = -1
+	resp.Header.Del("Content-Length")
+	resp.Header.Del("Transfer-Encoding")
 	resp.Header.Set("Content-Encoding", string(algo))
 	resp.Header.Add("Vary", "Accept-Encoding")
-	// 移除 Transfer-Encoding，避免与 Content-Encoding 冲突
-	resp.Header.Del("Transfer-Encoding")
+
+	go func() {
+		defer src.Close()
+		pw.CloseWithError(n.streamCompress(src, pw, algo))
+	}()
 
 	return nil
+}
+
+// streamCompress 将 src 经压缩 writer 写入 dst
+// io.Copy 内部使用池化缓冲，无需另行分配
+func (n *Negotiator) streamCompress(src io.Reader, dst io.Writer, algo Algorithm) error {
+	w, err := n.acquireWriter(dst, algo)
+	if err != nil {
+		return err
+	}
+
+	_, cpErr := io.Copy(w, src)
+
+	closeErr := w.Close()
+	n.releaseWriter(w, algo)
+
+	if cpErr != nil {
+		return cpErr
+	}
+	return closeErr
+}
+
+// acquireWriter 从池中获取（或新建）压缩 writer 并指向 dst
+func (n *Negotiator) acquireWriter(dst io.Writer, algo Algorithm) (io.WriteCloser, error) {
+	switch algo {
+	case Gzip:
+		if w, ok := n.gzipWriters.Get().(*gzip.Writer); ok {
+			w.Reset(dst)
+			return w, nil
+		}
+		return gzip.NewWriterLevel(dst, n.getLevel(Gzip))
+	case Brotli:
+		if w, ok := n.brotliWriters.Get().(*brotli.Writer); ok {
+			w.Reset(dst)
+			return w, nil
+		}
+		return brotli.NewWriterLevel(dst, n.getLevel(Brotli)), nil
+	case Zstd:
+		if w, ok := n.zstdEncoders.Get().(*zstd.Encoder); ok {
+			w.Reset(dst)
+			return w, nil
+		}
+		return zstd.NewWriter(dst, zstd.WithEncoderLevel(zstd.EncoderLevel(n.getLevel(Zstd))))
+	}
+	return nil, fmt.Errorf("不支持的压缩算法: %s", algo)
+}
+
+// releaseWriter 重置并归还压缩 writer 到池
+func (n *Negotiator) releaseWriter(w io.WriteCloser, algo Algorithm) {
+	switch algo {
+	case Gzip:
+		zw := w.(*gzip.Writer)
+		zw.Reset(io.Discard)
+		n.gzipWriters.Put(zw)
+	case Brotli:
+		bw := w.(*brotli.Writer)
+		bw.Reset(io.Discard)
+		n.brotliWriters.Put(bw)
+	case Zstd:
+		zw := w.(*zstd.Encoder)
+		zw.Reset(io.Discard)
+		n.zstdEncoders.Put(zw)
+	}
 }
 
 // ContentEncoding 返回算法对应的 Content-Encoding 值

@@ -1,0 +1,44 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: 构建前端运行时
+        working-directory: scripts
+        run: bun install --frozen-lockfile && bun run build
+
+      - name: 交叉编译二进制
+        run: |
+          mkdir -p release
+          for target in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64" "windows amd64"; do
+            set -- $target
+            os=$1; arch=$2
+            ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "release/cifera-${os}-${arch}${ext}" .
+          done
+
+      - name: 生成校验和
+        working-directory: release
+        run: sha256sum * > SHA256SUMS.txt
+
+      - name: 发布
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
