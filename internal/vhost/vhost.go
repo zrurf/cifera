@@ -1,8 +1,7 @@
-// Package vhost 实现虚拟主机资源服务
-// 允许主程序和 addon 注册虚拟主机，将主机名映射到本地目录或远程 URL
-// 支持两种优先级策略：
-//   - override: 直接由虚拟主机服务响应，不经过代理
-//   - fallback: 先代理到源站，状态码命中 fallback_status 正则时由虚拟主机服务
+// Package vhost 实现虚拟主机资源服务：将主机名映射到本地目录或远程 URL
+// 优先级策略：
+//   - override：直接由虚拟主机响应，不经过代理
+//   - fallback：先走代理，源站状态码命中 fallback_status 正则时由虚拟主机响应
 package vhost
 
 import (
@@ -86,9 +85,7 @@ func NewRegistry(logger *zap.Logger) *Registry {
 	}
 }
 
-// Lookup 查找虚拟主机
-// hostParam: _cifera_h 参数值；requestHost: r.Host（直接访问场景）
-// 查找顺序：hostParam → requestHost
+// Lookup 查找虚拟主机，顺序：hostParam（_cifera_h）→ requestHost（r.Host）
 func (r *Registry) Lookup(hostParam, requestHost string) *Host {
 	if hostParam != "" {
 		if vh, ok := r.hosts[strings.ToLower(hostParam)]; ok {
@@ -187,25 +184,20 @@ func compileHost(hc HostConfig, addonDir string, logger *zap.Logger) (*Host, err
 		return nil, fmt.Errorf("name 不能包含空白字符: %q", hc.Name)
 	}
 
-	// 校验 type
 	switch hc.Type {
 	case HostTypeLocal, HostTypeRemote:
-		// 合法
 	default:
 		return nil, fmt.Errorf("无效的 type: %s（支持 local/remote）", hc.Type)
 	}
 
-	// 校验 priority
 	switch hc.Priority {
 	case PriorityOverride, PriorityFallback:
-		// 合法
 	default:
 		return nil, fmt.Errorf("无效的 priority: %s（支持 override/fallback）", hc.Priority)
 	}
 
 	h := &Host{Config: hc}
 
-	// 编译 fallback_status 正则
 	if hc.Priority == PriorityFallback {
 		pattern := hc.FallbackStatus
 		if pattern == "" {
@@ -225,7 +217,6 @@ func compileHost(hc HostConfig, addonDir string, logger *zap.Logger) (*Host, err
 		h.fallbackRegex = re
 	}
 
-	// 类型特定校验与编译
 	switch hc.Type {
 	case HostTypeLocal:
 		if hc.Path == "" {
@@ -248,7 +239,6 @@ func compileHost(hc HostConfig, addonDir string, logger *zap.Logger) (*Host, err
 		if err != nil {
 			return nil, fmt.Errorf("解析本地路径失败: %w", err)
 		}
-		// 校验目录存在
 		info, err := os.Stat(absBase)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -269,7 +259,6 @@ func compileHost(hc HostConfig, addonDir string, logger *zap.Logger) (*Host, err
 		if err != nil {
 			return nil, fmt.Errorf("remote URL 解析失败: %w", err)
 		}
-		// 仅允许 http/https
 		if remoteURL.Scheme != "http" && remoteURL.Scheme != "https" {
 			return nil, fmt.Errorf("remote URL 仅支持 http/https，当前: %s", remoteURL.Scheme)
 		}
@@ -296,7 +285,7 @@ func (h *Host) FallbackMatches(statusCode int) bool {
 	return matched
 }
 
-// Serve 处理请求并返回响应（分发到 serveLocal / serveRemote）
+// Serve 分发请求到 serveLocal / serveRemote
 func (h *Host) Serve(r *http.Request) (*http.Response, error) {
 	switch h.Config.Type {
 	case HostTypeLocal:

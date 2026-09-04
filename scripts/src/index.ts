@@ -3,10 +3,9 @@
  * 导入并注册所有拦截器
  */
 
-// 导出 URL 改写函数供外部使用
 export { rewriteUrl } from './rewriter';
 
-// 初始化 Cookie 托管（hook document.cookie，Shadow Cookie Jar，脏标记）
+// 初始化 Shadow Cookie Jar 托管（hook document.cookie）
 import { initCookieManager } from './cookie';
 initCookieManager();
 

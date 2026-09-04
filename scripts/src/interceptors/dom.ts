@@ -1,18 +1,16 @@
 /**
- * DOM API 拦截器
- * 拦截 setAttribute、property 赋值、MutationObserver 等
+ * DOM 拦截器：拦截 setAttribute / property 赋值 / MutationObserver，改写 URL 属性
  */
 
 import { rewriteUrl } from '../rewriter';
 
-// 通用 URL 属性名集合（适用于所有标签）
+// 通用 URL 属性白名单（所有标签）
 const URL_ATTRIBUTES = new Set([
     'src', 'href', 'action', 'poster', 'srcset',
     'cite', 'longdesc', 'profile', 'usemap', 'codebase', 'archive', 'background',
 ]);
 
-// 标签特定的 URL 属性白名单
-// 某些属性（如 data）仅在特定标签中才是 URL，其他标签中是普通数据
+// 标签特定白名单：同属性名因标签而异，如 data 仅在 object/embed/applet 中是 URL，其余标签为普通数据
 const TAG_SPECIFIC_URL_ATTRS: Record<string, Set<string>> = {
     'object': new Set(['data', 'src']),
     'applet': new Set(['data', 'src']),
@@ -42,31 +40,24 @@ const TAG_SPECIFIC_URL_ATTRS: Record<string, Set<string>> = {
     'del': new Set(['cite']),
 };
 
-/**
- * 判断在指定标签中，某个属性是否为 URL 属性
- */
+// 判断属性在指定标签中是否为 URL 属性
 function isUrlAttr(tagName: string, attrName: string): boolean {
     const lowerAttr = attrName.toLowerCase();
     const lowerTag = tagName.toLowerCase();
 
-    // data-* 自定义属性永远不是 URL
+    // data-* 自定义属性永不是 URL
     if (lowerAttr.startsWith('data-')) {
         return false;
     }
 
-    // 如果标签有特定的属性白名单，只改写白名单中的属性
     if (TAG_SPECIFIC_URL_ATTRS[lowerTag]) {
         return TAG_SPECIFIC_URL_ATTRS[lowerTag].has(lowerAttr);
     }
 
-    // 标签没有特定白名单，使用通用规则
     return URL_ATTRIBUTES.has(lowerAttr);
 }
 
-/**
- * 获取某个标签的所有 URL 属性名
- * 用于 MutationObserver 的 attributeFilter
- */
+// 标签的 URL 属性名集合，用于 MutationObserver attributeFilter
 function getUrlAttrsForTag(tagName: string): string[] {
     const lowerTag = tagName.toLowerCase();
     const tagSpecific = TAG_SPECIFIC_URL_ATTRS[lowerTag];
@@ -76,7 +67,7 @@ function getUrlAttrsForTag(tagName: string): string[] {
     return Array.from(URL_ATTRIBUTES);
 }
 
-// 需要拦截 property 的元素映射
+// 需拦截 property setter 的元素映射（prop → 对应属性名）
 const PROPERTY_DESCRIPTORS: Array<{
     proto: any;
     prop: string;
@@ -99,9 +90,7 @@ const PROPERTY_DESCRIPTORS: Array<{
     { proto: HTMLInputElement.prototype, prop: 'src', attr: 'src' },
 ];
 
-/**
- * 拦截 Element.prototype.setAttribute
- */
+// 拦截 Element.prototype.setAttribute，改写 URL 属性值
 const originalSetAttribute = Element.prototype.setAttribute;
 
 Element.prototype.setAttribute = function(name: string, value: string): void {
@@ -115,9 +104,7 @@ Element.prototype.setAttribute = function(name: string, value: string): void {
     return originalSetAttribute.call(this, name, value);
 };
 
-/**
- * 拦截 property descriptor（如 img.src = '...'）
- */
+// 改写属性 setter（如 img.src = '...'）
 function interceptPropertyDescriptors(): void {
     for (const { proto, prop } of PROPERTY_DESCRIPTORS) {
         const descriptor = Object.getOwnPropertyDescriptor(proto, prop);
@@ -146,16 +133,13 @@ function interceptPropertyDescriptors(): void {
 
 interceptPropertyDescriptors();
 
-/**
- * 改写单个元素的 URL 属性（基于标签感知白名单）
- */
+// 按标签白名单改写单个元素的 URL 属性
 function rewriteElementUrls(el: Element): void {
     if (!(el instanceof HTMLElement)) return;
 
     const tagName = el.tagName.toLowerCase();
     const tagSpecific = TAG_SPECIFIC_URL_ATTRS[tagName];
 
-    // 确定需要检查的属性集合
     const attrsToCheck: Set<string> = tagSpecific
         ? new Set([...tagSpecific])
         : new Set(URL_ATTRIBUTES);
@@ -175,9 +159,7 @@ function rewriteElementUrls(el: Element): void {
     }
 }
 
-/**
- * 递归改写元素及其子元素的 URL
- */
+// 递归改写元素树上的 URL 属性
 function rewriteElementTreeUrls(el: Element): void {
     rewriteElementUrls(el);
     const children = el.children;
@@ -186,7 +168,7 @@ function rewriteElementTreeUrls(el: Element): void {
     }
 }
 
-// 合并所有需要监控的属性名（通用 + 所有标签特定的）
+// 监控全部 URL 属性（通用 + 标签特定）
 const allUrlAttrs = new Set(URL_ATTRIBUTES);
 for (const tagAttrs of Object.values(TAG_SPECIFIC_URL_ATTRS)) {
     for (const attr of tagAttrs) {
@@ -194,12 +176,9 @@ for (const tagAttrs of Object.values(TAG_SPECIFIC_URL_ATTRS)) {
     }
 }
 
-/**
- * 使用 MutationObserver 监控 DOM 变更，改写新增元素的 URL
- */
+// 用 MutationObserver 改写动态新增/变更元素的 URL 属性
 const observer = new MutationObserver((mutations: MutationRecord[]) => {
     for (const mutation of mutations) {
-        // 处理新增节点
         if (mutation.type === 'childList') {
             for (const node of mutation.addedNodes) {
                 if (node instanceof HTMLElement) {
@@ -207,7 +186,6 @@ const observer = new MutationObserver((mutations: MutationRecord[]) => {
                 }
             }
         }
-        // 处理属性变更
         if (mutation.type === 'attributes' && mutation.target instanceof HTMLElement) {
             const attrName = mutation.attributeName;
             if (attrName && isUrlAttr(mutation.target.tagName, attrName)) {
@@ -227,7 +205,7 @@ const observer = new MutationObserver((mutations: MutationRecord[]) => {
     }
 });
 
-// 等待 DOM 准备就绪后开始观察
+// DOM 未就绪时等 DOMContentLoaded 再开始观察
 if (document.documentElement) {
     observer.observe(document.documentElement, {
         childList: true,

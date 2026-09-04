@@ -5,7 +5,6 @@
 
 import { rewriteUrl } from '../rewriter';
 
-// 拦截 Worker
 const OriginalWorker = window.Worker;
 
 if (OriginalWorker) {
@@ -20,11 +19,10 @@ if (OriginalWorker) {
         }
     } as any;
 
-    // 保留原型链
     (window as any).Worker.prototype = OriginalWorker.prototype;
 }
 
-// 拦截 SharedWorker
+// SharedWorker 同样处理（window.SharedWorker 可能不存在，故运行时判空）
 const OriginalSharedWorker = (window as any).SharedWorker;
 
 if (OriginalSharedWorker) {

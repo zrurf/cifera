@@ -1,15 +1,9 @@
 /**
  * Cookie 托管模块 — Shadow Cookie Jar
- * 
- * 使用 JS 内存对象维护 Shadow Cookie Jar，替代浏览器原生 Cookie 存储。
- * 与 Cifera 服务端 Cookie Jar 协同工作：
- *  - HTML 注入时，服务端通过 __CIFERA__.c（JSON 数组）下发全量 cookie 列表
- *  - JS 修改 cookie 后，标记为脏，在下一次 fetch/XHR 请求中通过 Cifera-Cookie-Sync 头增量同步给服务器
- *  - 服务器响应 Cifera-Cookie-Ack 头确认同步成功
- *  - 未确认的脏 cookie 会在下一次请求时重新同步（重试机制）
- *  - 页面导航时，新 HTML 会重新注入全量 cookie，Shadow Jar 自动重建
- * 
- * 删除操作：使用墓碑标记（e = -1），保留在 Shadow Jar 中直到 ACK 确认后再清除。
+ * 用 JS 内存对象替代浏览器原生 Cookie 存储，与服务端 Cookie Jar 协同：
+ *  - HTML 注入时经 __CIFERA__.c 全量下发，页面导航时自动重建
+ *  - JS 修改后标记脏，经 Cifera-Cookie-Sync 头增量同步，服务端以 Cifera-Cookie-Ack 确认
+ *  - 未确认的脏 cookie 下次请求重试；删除用墓碑（e = -1），ACK 确认后才清除
  */
 
 import { PROXY_HOST, PROXY_SCHEMA } from './rewriter';
@@ -19,7 +13,7 @@ export interface CookieEntry {
     n: string;  // name
     v: string;  // value
     p: string;  // path
-    e: number;  // expires (unix timestamp, 0 = session, -1 = 删除墓碑)
+    e: number;  // expires：unix 秒，0=会话，-1=删除墓碑
     s: boolean; // secure
     h: boolean; // httponly
 }
@@ -29,7 +23,6 @@ function cookieKey(name: string, path: string): string {
     return name + '|' + (path || '/');
 }
 
-// 路径匹配
 function pathMatch(requestPath: string, cookiePath: string): boolean {
     if (requestPath === cookiePath) return true;
     if (requestPath.startsWith(cookiePath)) {
@@ -39,10 +32,10 @@ function pathMatch(requestPath: string, cookiePath: string): boolean {
     return false;
 }
 
-// Shadow Cookie Jar：以 cookieKey 为键的 Map
+// Shadow Cookie Jar（key 为 cookieKey）
 const shadowJar = new Map<string, CookieEntry>();
 
-// 脏标记集合：未被 ACK 确认的 cookie key
+// 未获 ACK 确认的脏 cookie key 集合
 const dirtySet = new Set<string>();
 
 /**
@@ -109,9 +102,7 @@ function parseCookieString(cookieStr: string): CookieEntry | null {
     return entry;
 }
 
-/**
- * 从 Shadow Jar 获取匹配当前路径的 cookie 列表（已过滤过期/墓碑/不匹配）
- */
+// 获取匹配当前路径的有效 cookie（过滤过期/墓碑/路径不匹配/secure 不满足）
 function getMatchingCookies(): CookieEntry[] {
     const now = Date.now() / 1000;
     const requestPath = window.location.pathname;
@@ -119,22 +110,16 @@ function getMatchingCookies(): CookieEntry[] {
 
     const result: CookieEntry[] = [];
     for (const c of shadowJar.values()) {
-        // 墓碑不返回
         if (c.e === -1) continue;
-        // 过期检查
         if (c.e > 0 && c.e < now) continue;
-        // 路径匹配
         if (!pathMatch(requestPath, c.p)) continue;
-        // secure 检查
         if (c.s && !isSecure) continue;
         result.push(c);
     }
     return result;
 }
 
-/**
- * 从 CookieEntry 列表构建 document.cookie getter 字符串
- */
+// 构建 document.cookie getter 字符串
 function buildCookieString(entries: CookieEntry[]): string {
     return entries
         .filter(c => !c.h) // httponly 对 JS 不可见
@@ -146,9 +131,7 @@ function buildCookieString(entries: CookieEntry[]): string {
         .join('; ');
 }
 
-/**
- * Hook document.cookie
- */
+// Hook document.cookie 的 getter/setter
 function installCookieHook(): void {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
         Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
@@ -166,22 +149,20 @@ function installCookieHook(): void {
 
             const key = cookieKey(entry.n, entry.p);
 
-            // max-age <= 0 或已过期：标记为墓碑（e = -1），不立即删除
-            // 墓碑会随脏同步发送给服务器，ACK 后才清除
+            // 过期则标记为墓碑（e=-1）而非立即删除：随脏同步发给服务器，ACK 确认后才清除
             if (entry.e === -1 || (entry.e > 0 && entry.e < Date.now() / 1000)) {
                 const existing = shadowJar.get(key);
                 if (existing) {
-                    // 设置墓碑：保留 name/path 信息，标记 e = -1
+                    // 保留 name/path，覆盖为墓碑
                     shadowJar.set(key, { n: existing.n, v: '', p: existing.p, e: -1, s: false, h: false });
                 } else {
-                    // cookie 不存在但也记录墓碑（可能服务器端有）
+                    // 本地不存在也记录墓碑（服务器端可能存有）
                     shadowJar.set(key, { n: entry.n, v: '', p: entry.p, e: -1, s: false, h: false });
                 }
                 dirtySet.add(key);
                 return;
             }
 
-            // 更新 Shadow Jar
             shadowJar.set(key, entry);
             dirtySet.add(key);
         },
@@ -190,51 +171,38 @@ function installCookieHook(): void {
     });
 }
 
-/**
- * 清理过期 cookie（标记为脏以便同步删除到服务器）
- */
+// 过期 cookie 转墓碑并标记脏，以便同步删除到服务器
 function cleanExpired(): void {
     const now = Date.now() / 1000;
     for (const [key, c] of shadowJar) {
         if (c.e > 0 && c.e < now) {
-            // 过期 cookie 转为墓碑
             shadowJar.set(key, { n: c.n, v: '', p: c.p, e: -1, s: false, h: false });
             dirtySet.add(key);
         }
     }
 }
 
-/**
- * 初始化服务端注入的 cookie（全量同步）
- * 从 __CIFERA__.c 读取 cookie 数组，写入 Shadow Jar
- */
+// 从 __CIFERA__.c 全量初始化 Shadow Jar（HTML 注入时机）
 function initServerCookies(): void {
     const config = (window as any).__CIFERA__;
     if (!config || !config.c) return;
 
     const serverCookies: CookieEntry[] = config.c;
 
-    // 清空 Shadow Jar
     shadowJar.clear();
 
-    // 写入服务端下发的 cookie
     for (const c of serverCookies) {
         if (c.p === '') c.p = '/';
         shadowJar.set(cookieKey(c.n, c.p), c);
     }
 
-    // 全量同步后清除脏标记（全量注入本身是一次成功的同步）
+    // 全量注入即一次成功同步，无需再同步回去
     dirtySet.clear();
 }
 
 /**
- * 同步获取脏 cookie 同步头值
- * 从 Shadow Jar 内存构建，可安全在拦截器中同步调用
- * 格式：base64(JSON array of CookieEntry)
- * 包含墓碑条目（e = -1）表示删除操作
- * 
- * 注意：不立即清除脏标记，等待 ACK 确认后才清除
- * 如果 ACK 未收到，下次请求会重新同步
+ * 同步获取 Cifera-Cookie-Sync 头值：base64(JSON array of CookieEntry，含墓碑)
+ * 不清除脏标记，等 ACK 确认；未确认的 cookie 下次请求重试
  */
 export function getCookieSyncHeaderSync(): string {
     if (dirtySet.size === 0) return '';
@@ -261,12 +229,8 @@ export function getCookieSyncHeaderSync(): string {
 }
 
 /**
- * 处理 ACK 确认
- * 格式：name1|path1,name2|path2,...
- * 每个条目是 cookieKey 格式（与 dirtySet 中的 key 一致）
- * 
- * 确认成功的 cookie 从脏标记中移除，墓碑从 Shadow Jar 中清除
- * 未确认的 cookie 保留在脏标记中，下次请求时重试同步
+ * 处理 Cifera-Cookie-Ack：按 cookieKey 列表确认，移除脏标记，
+ * 已确认的墓碑从 Shadow Jar 中清除；未确认的保留待下次重试
  */
 export function processCookieAck(ack: string): void {
     if (!ack) return;
@@ -276,7 +240,7 @@ export function processCookieAck(ack: string): void {
     for (const key of confirmedKeys) {
         dirtySet.delete(key);
 
-        // 如果是墓碑（已删除的 cookie），确认后从 Shadow Jar 中清除
+        // 已确认的墓碑：从 Shadow Jar 清除
         const entry = shadowJar.get(key);
         if (entry && entry.e === -1) {
             shadowJar.delete(key);
@@ -285,13 +249,9 @@ export function processCookieAck(ack: string): void {
 }
 
 /**
- * 处理服务端增量推送的 cookie 变更（Cifera-Cookie-Push 头）
- * 格式与 Cifera-Cookie-Sync 一致：base64(JSON array of CookieEntry)
- * 
- * 服务端在拦截源站 Set-Cookie 后，通过此头将变更推送到客户端 Shadow Jar，
- * 使 XHR/fetch 请求的 cookie 变更无需等待下次 HTML 页面加载即可生效。
- * 
- * 推送的 cookie 不标记为脏（服务端已经知道这些值，无需再同步回去）
+ * 处理服务端推送的 cookie 变更（Cifera-Cookie-Push 头，格式与 Sync 一致）
+ * 服务端拦截源站 Set-Cookie 后推送，使 fetch/XHR 响应即可生效，无需等下次页面加载；
+ * 推送值不标记为脏（服务端已知，无需同步回去）
  */
 export function processCookiePush(pushValue: string): void {
     if (!pushValue) return;
@@ -305,13 +265,12 @@ export function processCookiePush(pushValue: string): void {
             const key = cookieKey(entry.n, entry.p);
 
             if (entry.e === -1) {
-                // 墓碑：删除 Shadow Jar 中的 cookie，同时清除脏标记
+                // 墓碑：从 Shadow Jar 删除，并清除脏标记
                 shadowJar.delete(key);
                 dirtySet.delete(key);
             } else {
-                // 新增/更新：写入 Shadow Jar，不标记为脏
+                // 写入非脏；若此前为脏（客户端也改过），以服务端值为准并清除脏标记
                 shadowJar.set(key, entry);
-                // 如果该 cookie 之前是脏的（客户端也修改了），服务端推送的值覆盖后清除脏标记
                 dirtySet.delete(key);
             }
         }
@@ -320,16 +279,12 @@ export function processCookiePush(pushValue: string): void {
     }
 }
 
-// 挂载到 window，供拦截器使用
+// 挂载到 window 供 fetch/XHR 拦截器调用
 (window as any).__cifera_getCookieSync__ = getCookieSyncHeaderSync;
 (window as any).__cifera_processCookieAck__ = processCookieAck;
 (window as any).__cifera_processCookiePush__ = processCookiePush;
 
-/**
- * 初始化 Cookie 托管系统
- * 1. 从 __CIFERA__.c 全量同步服务端 cookie 到 Shadow Jar
- * 2. Hook document.cookie
- */
+// 初始化：全量同步服务端 cookie，并 Hook document.cookie
 export function initCookieManager(): void {
     initServerCookies();
     installCookieHook();

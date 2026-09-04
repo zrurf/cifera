@@ -85,7 +85,7 @@ type LoadedAddon struct {
 	Dir      string // addon 目录的绝对路径
 }
 
-// InjectItem 表示一个待注入的项目
+// InjectItem 待注入的项目
 type InjectItem struct {
 	Position     InjectPosition
 	Content      []byte
@@ -93,7 +93,7 @@ type InjectItem struct {
 	AddonID      string // 来源 addon 的 ID
 }
 
-// MatchResult 表示匹配结果
+// MatchResult 规则匹配结果
 type MatchResult struct {
 	Rule    *Rule
 	AddonID string
@@ -109,7 +109,7 @@ func (r *Rule) ResourceContent() []byte {
 	return r.resourceContent
 }
 
-// ResourceType 返回资源文件类型
+// GetResourceType 返回资源文件类型
 func (r *Rule) GetResourceType() ResourceType {
 	return r.resourceType
 }

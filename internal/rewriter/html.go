@@ -44,7 +44,7 @@ var urlAttrNames = map[string]bool{
 }
 
 // tagSpecificURLAttrs 标签特定的 URL 属性
-// 某些属性（如 data）仅在特定标签中才是 URL，其他标签中是普通数据
+// 同一属性（如 data）仅在特定标签中是 URL，其余标签中按普通数据处理
 var tagSpecificURLAttrs = map[string]map[string]bool{
 	"object":     {"data": true},
 	"applet":     {"data": true},
@@ -74,9 +74,8 @@ var tagSpecificURLAttrs = map[string]map[string]bool{
 	"del":        {"cite": true},
 }
 
-// RewriteHTMLUrls 使用 html.Tokenizer 逐 token 遍历改写 HTML 中的 URL
-// 始终输出 raw 原始字节，通过替换 raw 中的属性值来改写 URL，
-// 绝不使用 token.String() 重新序列化，避免破坏原始 HTML 结构
+// RewriteHTMLUrls 用 html.Tokenizer 逐 token 改写 HTML 中的 URL
+// 直接修改 raw 原始字节而非 token.String() 重新序列化，避免破坏原始 HTML 结构
 func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema string) []byte {
 	r := bytes.NewReader(htmlBytes)
 	tokenizer := html.NewTokenizer(r)
@@ -100,13 +99,12 @@ func RewriteHTMLUrls(htmlBytes []byte, proxyBase, currentPath, host, schema stri
 			token := tokenizer.Token()
 			tagName := strings.ToLower(token.Data)
 
-			// 跟踪 <style> 标签
 			if tagName == "style" {
 				inStyle = true
 			}
 
 			if needsRewrite(token) {
-				// 构建 属性名→新值 的映射，传入标签名用于标签特定属性判断
+				// 传入标签名以支持标签特定属性的 URL 判断
 				replacements := buildAttrReplacements(token, proxyBase, currentPath, host, schema)
 				if len(replacements) > 0 {
 					modified := applyAttrReplacements(raw, replacements)
@@ -153,21 +151,19 @@ type attrReplacement struct {
 	newVal   string // 替换后的新值
 }
 
-// isURLAttr 判断在指定标签中，某个属性是否为 URL 属性
-// 结合通用 urlAttrNames 和标签特定 tagSpecificURLAttrs 判断
+// isURLAttr 判断某标签中指定属性是否为 URL 属性
 func isURLAttr(tagName, attrKey string) bool {
 	// data-* 自定义属性永远不是 URL
 	if strings.HasPrefix(attrKey, "data-") {
 		return false
 	}
 
-	// 如果标签有特定的属性白名单，只改写白名单中的属性
-	// 例如 iframe 只有 src 是 URL，data 属性不是 URL
+	// 有标签白名单时仅改写白名单属性（如 iframe 仅 src 是 URL）
 	if tagAttrs, ok := tagSpecificURLAttrs[tagName]; ok {
 		return tagAttrs[attrKey]
 	}
 
-	// 标签没有特定白名单，使用通用规则
+	// 无标签白名单时按通用属性规则判断
 	return urlAttrNames[attrKey]
 }
 
@@ -195,7 +191,6 @@ func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schem
 	isMetaRefresh := false
 	tagName := strings.ToLower(token.Data)
 
-	// 检查是否为 meta refresh
 	for _, attr := range token.Attr {
 		if attr.Key == "http-equiv" && strings.EqualFold(attr.Val, "refresh") {
 			isMetaRefresh = true
@@ -251,18 +246,15 @@ func buildAttrReplacements(token html.Token, proxyBase, currentPath, host, schem
 	return replacements
 }
 
-// applyAttrReplacements 在 raw 字节中替换属性值
-// 通过查找 attr="oldVal" 或 attr='oldVal' 模式，将 oldVal 替换为 newVal
+// applyAttrReplacements 查找 attr="oldVal" 或 attr='oldVal' 并替换为 newVal
 // 直接操作原始字节，不重新序列化整个标签
 func applyAttrReplacements(raw []byte, replacements []attrReplacement) []byte {
 	result := string(raw)
 
 	for _, rep := range replacements {
-		// 尝试双引号格式：attr="oldVal"
 		doubleQuoted := rep.attrName + `="` + rep.oldVal + `"`
 		doubleReplacement := rep.attrName + `="` + rep.newVal + `"`
 
-		// 尝试单引号格式：attr='oldVal'
 		singleQuoted := rep.attrName + `='` + rep.oldVal + `'`
 		singleReplacement := rep.attrName + `='` + rep.newVal + `'`
 
@@ -271,8 +263,7 @@ func applyAttrReplacements(raw []byte, replacements []attrReplacement) []byte {
 		} else if strings.Contains(result, singleQuoted) {
 			result = strings.Replace(result, singleQuoted, singleReplacement, 1)
 		} else {
-			// 属性值可能包含 HTML 实体编码（如 &amp;），尝试解码后匹配
-			// html.Tokenizer 会将 &amp; 解码为 &，但 raw 中仍是 &amp;
+			// Tokenizer 已将 &amp; 解码为 &，但 raw 中仍是 &amp;，需按解码值匹配
 			decodedOldVal := htmlEntityReplacer(rep.oldVal)
 			decodedDoubleQuoted := rep.attrName + `="` + decodedOldVal + `"`
 			decodedSingleQuoted := rep.attrName + `='` + decodedOldVal + `'`
@@ -285,7 +276,7 @@ func applyAttrReplacements(raw []byte, replacements []attrReplacement) []byte {
 				}
 			}
 
-			// 最后尝试：逐字符宽松匹配（处理引号内 HTML 实体）
+			// 兜底：逐字符宽松匹配
 			if strings.Contains(result, rep.attrName+"=") {
 				result = replaceAttrValueInRaw(result, rep.attrName, rep.newVal)
 			}
@@ -301,12 +292,10 @@ func htmlEntityReplacer(val string) string {
 	return strings.ReplaceAll(val, "&", "&amp;")
 }
 
-// replaceAttrValueInRaw 在原始 HTML 中查找指定属性并替换其值
-// 使用正则匹配来处理各种引号和编码情况
+// replaceAttrValueInRaw 用正则查找原始 HTML 中的属性并替换其值
 var reAttrValue = regexp.MustCompile(`(\bATTR\s*=\s*)(?:"([^"]*)"|'([^']*)')`)
 
 func replaceAttrValueInRaw(raw, attrName, newVal string) string {
-	// 使用缓存的正则，避免每次请求编译
 	re := getAttrRegex(attrName)
 
 	return re.ReplaceAllStringFunc(raw, func(match string) string {
@@ -316,10 +305,8 @@ func replaceAttrValueInRaw(raw, attrName, newVal string) string {
 		}
 		prefix := submatches[1]
 		if submatches[2] != "" {
-			// 双引号值
 			return prefix + `"` + newVal + `"`
 		}
-		// 单引号值
 		return prefix + `'` + newVal + `'`
 	})
 }

@@ -5,7 +5,7 @@ import (
 	"regexp"
 )
 
-// 用于定位 HTML 注入位置的正则（与 rewriter/inject.go 保持一致）
+// 定位 HTML 注入位置的正则（与 rewriter/inject.go 保持一致）
 var (
 	reHeadOpen  = regexp.MustCompile(`(?i)<head[^>]*>`)
 	reHeadClose = regexp.MustCompile(`(?i)</head>`)
@@ -13,17 +13,15 @@ var (
 	reBodyClose = regexp.MustCompile(`(?i)</body>`)
 )
 
-// InjectAddons 在 HTML 中按 position 注入 addon 的 JS/CSS
-// 注入顺序：按 InjectItem 在列表中的顺序依次注入
-// JS 资源用 <script>...</script> 包裹，CSS 资源用 <style>...</style> 包裹
+// InjectAddons 按 position 在 HTML 中注入 addon 的 JS/CSS
+// 同 position 按列表顺序注入；JS 用 <script> 包裹，CSS 用 <style> 包裹
 func InjectAddons(html []byte, injects []InjectItem) []byte {
 	if len(injects) == 0 {
 		return html
 	}
 
-	// 按 position 分组，保持同 position 内的顺序
+	// 按 position 分组，保持同 position 内顺序
 	grouped := make(map[InjectPosition][][]byte)
-	// 记录所有出现过的 position，保持插入顺序
 	var positions []InjectPosition
 	seen := make(map[InjectPosition]bool)
 
@@ -38,8 +36,7 @@ func InjectAddons(html []byte, injects []InjectItem) []byte {
 
 	result := html
 
-	// 按 position 优先级依次注入
-	// 优先级：head_start → head_end → body_start → body_end
+	// 按位置优先级（head_start → head_end → body_start → body_end）依次注入
 	positionOrder := []InjectPosition{
 		PositionHeadStart,
 		PositionHeadEnd,
@@ -53,7 +50,7 @@ func InjectAddons(html []byte, injects []InjectItem) []byte {
 			continue
 		}
 
-		// 合并同一 position 的所有注入内容
+		// 合并同一 position 的内容
 		var combined []byte
 		for _, chunk := range chunks {
 			combined = append(combined, chunk...)
@@ -73,7 +70,6 @@ func wrapResource(content []byte, resType ResourceType) []byte {
 	case ResourceTypeCSS:
 		return fmt.Appendf(nil, "<style>%s</style>", string(content))
 	default:
-		// 其他类型不包裹，直接返回
 		return content
 	}
 }

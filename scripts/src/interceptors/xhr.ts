@@ -1,14 +1,11 @@
 /**
- * XMLHttpRequest 拦截器
- * 拦截 XMLHttpRequest.prototype.open 调用，改写请求 URL，添加 Cifera-Referer 和 Cifera-Cookie-Sync 头
- * 处理响应中的 Cifera-Cookie-Ack 头确认 cookie 同步
+ * XHR 拦截器：改写 open() 的 URL，附加 Cifera-Referer / Cifera-Cookie-Sync 头，
+ * 并在响应中处理 Cifera-Cookie-Ack / Cifera-Cookie-Push
  */
 
 import { rewriteUrl, PROXY_HOST, PROXY_SCHEMA } from '../rewriter';
 
-/**
- * 构建当前页面的原始 URL（用于 Cifera-Referer 头）
- */
+// 源站页面 URL（scheme://PROXY_HOST + 当前路径），作为 Cifera-Referer
 function buildCiferaReferer(): string {
     if (!PROXY_HOST) return '';
     const schema = PROXY_SCHEMA || 'http';
@@ -16,26 +13,20 @@ function buildCiferaReferer(): string {
     return schema + '://' + PROXY_HOST + path;
 }
 
-/**
- * 同步获取脏 cookie 同步头
- */
+// 读取全局挂载的脏 cookie 同步函数
 function getCookieSyncHeaderSync(): string {
     const getDirty = (window as any).__cifera_getCookieSync__;
     if (!getDirty) return '';
     return getDirty();
 }
 
-/**
- * 处理 cookie 同步 ACK
- */
+// 转发 ACK 给全局处理器
 function processCookieAck(ack: string): void {
     const fn = (window as any).__cifera_processCookieAck__;
     if (fn) fn(ack);
 }
 
-/**
- * 处理服务端 cookie 增量推送
- */
+// 应用服务端推送的 cookie 变更
 function processCookiePush(push: string): void {
     const fn = (window as any).__cifera_processCookiePush__;
     if (fn) fn(push);
@@ -52,7 +43,7 @@ XMLHttpRequest.prototype.open = function(
 ): void {
     try {
         const rewrittenUrl = typeof url === 'string' ? rewriteUrl(url) : rewriteUrl(url.href);
-        // 保留原始参数传递方式
+        // 按原参数个数透传，保持调用形态一致
         if (async === undefined) {
             originalOpen.call(this, method, rewrittenUrl, true);
         } else if (username === undefined || username === null) {
@@ -63,19 +54,18 @@ XMLHttpRequest.prototype.open = function(
             originalOpen.call(this, method, rewrittenUrl, async, username, password);
         }
 
-        // 添加 Cifera-Referer 头
         const referer = buildCiferaReferer();
         if (referer) {
             this.setRequestHeader('Cifera-Referer', referer);
         }
 
-        // 添加 Cifera-Cookie-Sync 头（脏 cookie 增量同步）
+        // 脏 cookie 增量同步
         const cookieSync = getCookieSyncHeaderSync();
         if (cookieSync) {
             this.setRequestHeader('Cifera-Cookie-Sync', cookieSync);
         }
 
-        // 监听响应，处理 Cifera-Cookie-Ack 和 Cifera-Cookie-Push 头
+        // 拦截响应，处理 Cifera-Cookie-Ack / Cifera-Cookie-Push
         this.addEventListener('load', function() {
             try {
                 const ack = this.getResponseHeader('Cifera-Cookie-Ack');

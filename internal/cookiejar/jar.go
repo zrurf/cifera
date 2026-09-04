@@ -8,27 +8,27 @@ import (
 	"time"
 )
 
-// CookieEntry represents a stored cookie with metadata.
+// CookieEntry 一条持久化的 cookie 及其元数据
 type CookieEntry struct {
 	Name     string    `json:"name"`
 	Value    string    `json:"value"`
-	Domain   string    `json:"domain"`    // original domain from Set-Cookie (lowercase, no leading dot)
+	Domain   string    `json:"domain"`    // 来自 Set-Cookie 的原始 domain（小写，无前导点）
 	Path     string    `json:"path"`      // cookie path
-	Expires  time.Time `json:"expires"`   // zero value means session cookie
-	MaxAge   int       `json:"max_age"`   // Max-Age attribute, 0 means not set
-	Secure   bool      `json:"secure"`    // Secure attribute
-	HttpOnly bool      `json:"http_only"` // HttpOnly attribute
-	SameSite int       `json:"same_site"` // SameSite attribute (0=default, 1=Lax, 2=Strict, 3=None)
-	Created  time.Time `json:"created"`   // when the cookie was created
-	HostOnly bool      `json:"host_only"` // true if Domain attribute was not set
+	Expires  time.Time `json:"expires"`   // 零值表示会话 cookie
+	MaxAge   int       `json:"max_age"`   // Max-Age 属性，0 表示未设置
+	Secure   bool      `json:"secure"`    // Secure 属性
+	HttpOnly bool      `json:"http_only"` // HttpOnly 属性
+	SameSite int       `json:"same_site"` // SameSite 属性（0=Default, 1=Lax, 2=Strict, 3=None）
+	Created  time.Time `json:"created"`   // cookie 创建时间
+	HostOnly bool      `json:"host_only"` // 未设置 Domain 属性时为 true
 }
 
-// isSessionCookie returns true if this is a session cookie (no expiry).
+// isSessionCookie 判断是否为会话 cookie（无过期时间）
 func (e *CookieEntry) isSessionCookie() bool {
 	return e.Expires.IsZero() && e.MaxAge == 0
 }
 
-// isExpired returns true if the cookie has expired.
+// isExpired 判断 cookie 是否已过期
 func (e *CookieEntry) isExpired() bool {
 	if e.isSessionCookie() {
 		return false
@@ -39,14 +39,14 @@ func (e *CookieEntry) isExpired() bool {
 	return !e.Expires.IsZero() && time.Now().After(e.Expires)
 }
 
-// Jar stores cookies for a single session, keyed by (domain, path, name).
+// Jar 存储单个会话的 cookie，按 (domain, path, name) 组织
 type Jar struct {
 	mu      sync.RWMutex
-	cookies map[string]map[string]*CookieEntry // key1: domain (lowercase), key2: name+"\x00"+path
+	cookies map[string]map[string]*CookieEntry // 第一层 key：domain（小写）；第二层 key：name+"\x00"+path
 	maxSize int
 }
 
-// NewJar creates an empty cookie jar with the given max capacity.
+// NewJar 创建空 cookie jar，容量 maxSize（<=0 时默认 500）
 func NewJar(maxSize int) *Jar {
 	if maxSize <= 0 {
 		maxSize = 500
@@ -57,13 +57,12 @@ func NewJar(maxSize int) *Jar {
 	}
 }
 
-// cookieKey returns the map key for a cookie entry: name + separator + path.
+// cookieKey 返回 cookie 条目在 map 中的键：name + "\x00" + path
 func cookieKey(name, path string) string {
 	return name + "\x00" + path
 }
 
-// AddCookie adds or updates a cookie in the jar following RFC 6265 rules.
-// The cookie's domain is used as-is (should be canonicalized before calling).
+// AddCookie 按 RFC 6265 规则新增或更新 cookie
 func (j *Jar) AddCookie(cookie *http.Cookie, requestHost string) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -78,33 +77,28 @@ func (j *Jar) AddCookie(cookie *http.Cookie, requestHost string) {
 		Created:  time.Now(),
 	}
 
-	// Determine domain and host-only flag
 	if cookie.Domain != "" {
 		entry.Domain = canonicalDomain(cookie.Domain)
 		entry.HostOnly = false
 	} else {
-		// No Domain attribute: host-only cookie, domain is the request host
 		entry.Domain = canonicalDomain(requestHost)
 		entry.HostOnly = true
 	}
 
-	// Default path to "/" if not set
 	if entry.Path == "" {
 		entry.Path = "/"
 	}
 
-	// Handle expiration
 	if cookie.MaxAge > 0 {
 		entry.MaxAge = cookie.MaxAge
 	} else if cookie.MaxAge < 0 {
-		// MaxAge < 0 means delete the cookie
+		// MaxAge<0 表示删除该 cookie
 		j.removeCookie(entry.Domain, cookieKey(entry.Name, entry.Path))
 		return
 	} else if !cookie.Expires.IsZero() {
 		entry.Expires = cookie.Expires
 	}
 
-	// If the cookie is already expired, don't store it
 	if entry.isExpired() {
 		return
 	}
@@ -116,7 +110,6 @@ func (j *Jar) AddCookie(cookie *http.Cookie, requestHost string) {
 		j.cookies[domain] = make(map[string]*CookieEntry)
 	}
 
-	// Enforce max size: if we'd exceed capacity, remove the oldest cookie
 	if _, exists := j.cookies[domain][key]; !exists {
 		j.evictIfNeeded()
 	}
@@ -124,7 +117,7 @@ func (j *Jar) AddCookie(cookie *http.Cookie, requestHost string) {
 	j.cookies[domain][key] = entry
 }
 
-// removeCookie removes a cookie from the jar.
+// removeCookie 删除指定 cookie，domain 下无剩余 cookie 时一并清理
 func (j *Jar) removeCookie(domain, key string) {
 	if m, ok := j.cookies[domain]; ok {
 		delete(m, key)
@@ -134,14 +127,13 @@ func (j *Jar) removeCookie(domain, key string) {
 	}
 }
 
-// evictIfNeeded removes the oldest cookie if the jar is at capacity.
+// evictIfNeeded 容量已满时淘汰最早创建的 cookie
 func (j *Jar) evictIfNeeded() {
 	total := j.totalCount()
 	if total < j.maxSize {
 		return
 	}
 
-	// Find and remove the oldest cookie
 	var oldest *CookieEntry
 	var oldestDomain string
 	var oldestKey string
@@ -161,7 +153,7 @@ func (j *Jar) evictIfNeeded() {
 	}
 }
 
-// totalCount returns the total number of cookies in the jar.
+// totalCount 返回 jar 中的 cookie 总数
 func (j *Jar) totalCount() int {
 	count := 0
 	for _, m := range j.cookies {
@@ -170,8 +162,7 @@ func (j *Jar) totalCount() int {
 	return count
 }
 
-// Cookies returns all applicable cookies for the given host and path.
-// Cookies are sorted by path length (longest first) per RFC 6265.
+// Cookies 返回匹配 host/path 的适用 cookie，按 path 长度降序（RFC 6265：最长 path 优先）
 func (j *Jar) Cookies(host, path string) []*http.Cookie {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -180,31 +171,25 @@ func (j *Jar) Cookies(host, path string) []*http.Cookie {
 	var result []*http.Cookie
 
 	for domain, m := range j.cookies {
-		// Check domain matching
 		if !domainMatch(host, domain) {
 			continue
 		}
 
 		for _, entry := range m {
-			// Check host-only restriction
+			// host-only cookie 仅匹配完全一致的 host
 			if entry.HostOnly && host != domain {
 				continue
 			}
 
-			// Skip expired cookies
 			if entry.isExpired() {
 				continue
 			}
 
-			// Check path matching
 			if !pathMatch(path, entry.Path) {
 				continue
 			}
 
-			// Secure cookies only sent to HTTPS hosts
-			// (the proxy handles HTTP/HTTPS; we skip this check as the proxy
-			// itself may be HTTP while the origin is HTTPS)
-
+			// 不校验 Secure cookie 的 HTTPS 限制：代理自身可能为 http，而源站为 https
 			result = append(result, &http.Cookie{
 				Name:     entry.Name,
 				Value:    entry.Value,
@@ -218,7 +203,7 @@ func (j *Jar) Cookies(host, path string) []*http.Cookie {
 		}
 	}
 
-	// Sort by path length (longest first), then by creation time
+	// 按 path 长度降序（等长保持原顺序）
 	sort.SliceStable(result, func(i, j int) bool {
 		if len(result[i].Path) != len(result[j].Path) {
 			return len(result[i].Path) > len(result[j].Path)
@@ -229,7 +214,7 @@ func (j *Jar) Cookies(host, path string) []*http.Cookie {
 	return result
 }
 
-// RemoveExpired removes all expired cookies from the jar.
+// RemoveExpired 删除 jar 中所有已过期的 cookie
 func (j *Jar) RemoveExpired() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -246,7 +231,7 @@ func (j *Jar) RemoveExpired() {
 	}
 }
 
-// IsExpired returns true if all cookies in the jar are expired (or the jar is empty).
+// IsExpired 判断 jar 是否所有 cookie 均已过期（空 jar 视为过期）
 func (j *Jar) IsExpired() bool {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -261,8 +246,7 @@ func (j *Jar) IsExpired() bool {
 	return true
 }
 
-// AllCookies returns all non-expired cookies in the jar (for persistence).
-// Session cookies (no expiry) are NOT included for persistence.
+// AllCookies 返回所有未过期 cookie（用于持久化），会话 cookie 不参与持久化
 func (j *Jar) AllCookies() []CookieEntry {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
@@ -273,7 +257,6 @@ func (j *Jar) AllCookies() []CookieEntry {
 			if entry.isExpired() {
 				continue
 			}
-			// Skip session cookies for persistence
 			if entry.isSessionCookie() {
 				continue
 			}
@@ -283,7 +266,7 @@ func (j *Jar) AllCookies() []CookieEntry {
 	return result
 }
 
-// RestoreCookies restores cookies from persistence into the jar.
+// RestoreCookies 将持久化的 cookie 条目恢复到 jar
 func (j *Jar) RestoreCookies(entries []CookieEntry) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -291,7 +274,6 @@ func (j *Jar) RestoreCookies(entries []CookieEntry) {
 	for i := range entries {
 		entry := &entries[i]
 
-		// Skip already expired cookies
 		if entry.isExpired() {
 			continue
 		}

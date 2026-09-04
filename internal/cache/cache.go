@@ -79,14 +79,12 @@ func New(cfg Config, logger *zap.Logger) *Cache {
 	}
 	c.maxSize.Store(maxSize)
 
-	// 启动后台写入 goroutine
 	go c.writeLoop()
 
 	return c
 }
 
-// writeLoop 后台缓存写入循环
-// 所有写入操作由这个 goroutine 串行执行，无需加锁
+// writeLoop 由单个 goroutine 串行执行所有写入，无需加锁
 func (c *Cache) writeLoop() {
 	defer close(c.done)
 
@@ -98,7 +96,7 @@ func (c *Cache) writeLoop() {
 // Close 关闭缓存，等待后台写入完成
 func (c *Cache) Close() {
 	close(c.writeCh)
-	<-c.done // 等待写入循环结束
+	<-c.done
 }
 
 // Get 从缓存中获取条目
@@ -113,7 +111,6 @@ func (c *Cache) Get(key string) (*http.Response, bool) {
 
 	e := elem.Value.(*entry)
 
-	// 检查 TTL
 	if e.ttl > 0 && time.Since(e.storedAt) > e.ttl {
 		c.removeElement(elem)
 		c.mu.Unlock()
@@ -121,13 +118,11 @@ func (c *Cache) Get(key string) (*http.Response, bool) {
 		return nil, false
 	}
 
-	// 移动到 LRU 前端
 	c.lru.MoveToFront(elem)
 	c.mu.Unlock()
 
 	c.hits.Add(1)
 
-	// 构造 http.Response
 	resp := &http.Response{
 		StatusCode: e.statusCode,
 		Header:     e.header.Clone(),
@@ -136,9 +131,8 @@ func (c *Cache) Get(key string) (*http.Response, bool) {
 	return resp, true
 }
 
-// SetAsync 异步存储条目到缓存
-// 不阻塞调用者，写入操作由后台 goroutine 执行
-// body 的所有权转移给缓存（调用者不应再修改 body）
+// SetAsync 异步存储条目，不阻塞调用者（写入由后台 goroutine 执行）
+// body 所有权转移给缓存，调用者不应再修改
 func (c *Cache) SetAsync(key string, header http.Header, body []byte, statusCode int) {
 	if len(body) == 0 {
 		return
@@ -146,16 +140,15 @@ func (c *Cache) SetAsync(key string, header http.Header, body []byte, statusCode
 
 	req := &cacheWriteRequest{
 		key:        key,
-		header:     header.Clone(), // 必须克隆，因为原始 header 可能被回收
-		body:       body,           // body 已是拷贝，直接转移所有权
+		header:     header.Clone(), // 克隆以避免调用者后续修改影响缓存
+		body:       body,           // body 已由调用者拷贝，直接转移所有权
 		statusCode: statusCode,
 	}
 
 	select {
 	case c.writeCh <- req:
-		// 成功提交写入请求
 	default:
-		// 通道已满，丢弃本次写入（避免阻塞请求）
+		// 通道已满则丢弃写入，避免阻塞
 		c.logger.Debug("缓存写入通道已满，丢弃",
 			zap.String("key", key),
 			zap.Int("ch_len", len(c.writeCh)),
@@ -169,7 +162,6 @@ func (c *Cache) setLocked(key string, header http.Header, body []byte, statusCod
 		return
 	}
 
-	// 计算 TTL
 	ttl := extractTTLFromHeader(header)
 	if ttl == 0 {
 		ttl = 5 * time.Minute
@@ -182,12 +174,10 @@ func (c *Cache) setLocked(key string, header http.Header, body []byte, statusCod
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 如果已存在，先移除旧条目
 	if elem, ok := c.items[key]; ok {
 		c.removeElementLocked(elem)
 	}
 
-	// 确保有足够空间
 	maxSize := c.maxSize.Load()
 	for c.curSize+entrySize > maxSize && c.lru.Len() > 0 {
 		oldest := c.lru.Back()
@@ -196,7 +186,6 @@ func (c *Cache) setLocked(key string, header http.Header, body []byte, statusCod
 		}
 	}
 
-	// 存储新条目
 	e := &entry{
 		key:        key,
 		header:     header,
@@ -222,7 +211,6 @@ func (c *Cache) Resize(newMaxSize int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 淘汰超出新容量的条目
 	for c.curSize > newMaxSize && c.lru.Len() > 0 {
 		oldest := c.lru.Back()
 		if oldest != nil {
@@ -265,13 +253,13 @@ func IsCacheable(resp *http.Response, r *http.Request) bool {
 		return false
 	}
 
-	// 检查 Content-Type：不缓存 HTML（HTML 需要改写，缓存策略不同），不缓存JSON
+	// Content-Type：不缓存 HTML（其响应需改写）与 JSON
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/json") {
 		return false
 	}
 
-	// 检查 Cache-Control
+	// Cache-Control：no-store/private 表示响应不可共享缓存
 	cc := resp.Header.Get("Cache-Control")
 	if cc != "" {
 		ccLower := strings.ToLower(cc)
@@ -280,7 +268,7 @@ func IsCacheable(resp *http.Response, r *http.Request) bool {
 		}
 	}
 
-	// 检查 Authorization 头（安全考虑，不缓存需要认证的响应）
+	// 不缓存带 Authorization 的响应（需要认证，安全考虑）
 	if r.Header.Get("Authorization") != "" {
 		return false
 	}
@@ -297,8 +285,6 @@ func IsCacheable(resp *http.Response, r *http.Request) bool {
 
 	return true
 }
-
-// --- 内部方法 ---
 
 func (c *Cache) removeElement(elem *list.Element) {
 	e := elem.Value.(*entry)

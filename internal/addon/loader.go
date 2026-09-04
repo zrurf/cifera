@@ -13,9 +13,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// LoadAddons 从指定目录加载所有 addon
-// dir: addon 加载目录
-// enabled: 仅加载指定 ID 的 addon；若为空则加载全部
+// LoadAddons 从指定目录加载 addon
+// enabled 为空时加载全部，否则仅加载其中指定的 addon ID
 func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddon, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -46,13 +45,12 @@ func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddo
 		addonDir := filepath.Join(absDir, entry.Name())
 		manifestPath := filepath.Join(addonDir, "addon.toml")
 
-		// 检查 addon.toml 是否存在
 		if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
 			logger.Debug("跳过无 addon.toml 的目录", zap.String("dir", addonDir))
 			continue
 		}
 
-		// 解析 addon.toml
+		// 解析 addon.toml（含必填字段校验）
 		manifest, err := parseManifest(manifestPath)
 		if err != nil {
 			logger.Error("解析 addon.toml 失败",
@@ -62,7 +60,7 @@ func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddo
 			continue
 		}
 
-		// 如果指定了 enabled 列表，检查当前 addon 是否在其中
+		// 仅加载 enabled 列表中出现的 addon
 		if len(enabledSet) > 0 && !enabledSet[manifest.Addon.ID] {
 			logger.Debug("addon 未启用，跳过",
 				zap.String("id", manifest.Addon.ID),
@@ -80,7 +78,6 @@ func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddo
 			continue
 		}
 
-		// 验证规则合法性
 		if err := validateRules(manifest, logger); err != nil {
 			logger.Error("addon 规则验证失败",
 				zap.String("id", manifest.Addon.ID),
@@ -89,7 +86,6 @@ func LoadAddons(dir string, enabled []string, logger *zap.Logger) ([]*LoadedAddo
 			continue
 		}
 
-		// 验证虚拟主机配置
 		if err := validateHosts(manifest, logger); err != nil {
 			logger.Error("addon 虚拟主机配置验证失败",
 				zap.String("id", manifest.Addon.ID),
@@ -129,7 +125,6 @@ func parseManifest(path string) (*AddonManifest, error) {
 		return nil, fmt.Errorf("解析 TOML 失败: %w", err)
 	}
 
-	// 验证必填字段
 	if manifest.Addon.ID == "" {
 		return nil, fmt.Errorf("addon.id 不能为空")
 	}
@@ -139,7 +134,7 @@ func parseManifest(path string) (*AddonManifest, error) {
 	if manifest.Addon.Version == "" {
 		return nil, fmt.Errorf("addon.version 不能为空")
 	}
-	// rules 和 hosts 至少存在一个
+	// rules 与 hosts 至少存在一个
 	if len(manifest.Rules) == 0 && len(manifest.Hosts) == 0 {
 		return nil, fmt.Errorf("至少需要一条 rule 或一个 host 配置")
 	}
@@ -152,7 +147,6 @@ func compileRules(manifest *AddonManifest, addonDir string, logger *zap.Logger) 
 	for i := range manifest.Rules {
 		rule := &manifest.Rules[i]
 
-		// 编译正则表达式
 		if len(rule.Patterns) == 0 {
 			return fmt.Errorf("rule[%d]: pattern 不能为空", i)
 		}
@@ -166,10 +160,8 @@ func compileRules(manifest *AddonManifest, addonDir string, logger *zap.Logger) 
 			rule.compiledPatterns = append(rule.compiledPatterns, re)
 		}
 
-		// 验证 action
 		switch rule.Action {
 		case ActionBlock, ActionReplace, ActionReplaceContent, ActionInject:
-			// 合法
 		default:
 			return fmt.Errorf("rule[%d]: 不支持的 action 类型: %s", i, rule.Action)
 		}
@@ -198,7 +190,6 @@ func validateRules(manifest *AddonManifest, logger *zap.Logger) error {
 			if rule.StatusCode == 0 {
 				manifest.Rules[i].StatusCode = 404
 			}
-			// 验证状态码合法性
 			if rule.StatusCode < 100 || rule.StatusCode > 599 {
 				return fmt.Errorf("rule[%d]: 无效的 status_code: %d", i, rule.StatusCode)
 			}
@@ -222,17 +213,14 @@ func validateRules(manifest *AddonManifest, logger *zap.Logger) error {
 			if rule.resourceType != ResourceTypeJS && rule.resourceType != ResourceTypeCSS {
 				return fmt.Errorf("rule[%d]: action=inject 仅支持 JS 和 CSS 资源，当前: %s", i, rule.resourceType)
 			}
-			// 验证 position 值
 			switch rule.Position {
 			case PositionHeadStart, PositionHeadEnd, PositionBodyStart, PositionBodyEnd:
-				// 合法
 			default:
 				return fmt.Errorf("rule[%d]: 不支持的 position: %s", i, rule.Position)
 			}
 		}
 
-		// 检查 ID 唯一性在此处不做，因为同一 manifest 内 ID 相同
-		// 跨 addon 的 ID 唯一性在 LoadAddons 中已通过 enabled 机制保证
+		// ID 唯一性不在本处检查：同一 manifest 内 ID 唯一，跨 addon 由 LoadAddons 的 enabled 机制保证
 		_ = i
 	}
 
@@ -252,9 +240,8 @@ func detectResourceType(filename string) ResourceType {
 	}
 }
 
-// validateHosts 验证虚拟主机配置的基本字段合法性
-// 注意：实际的路径解析、目录存在性校验、正则编译在 vhost.LoadFromAddonHosts 中完成
-// 此处仅做基本字段校验，避免与 vhost 包逻辑重复
+// validateHosts 校验虚拟主机配置的基本字段
+// 路径解析、目录校验与正则编译由 vhost.LoadFromAddonHosts 负责，此处不重复
 func validateHosts(manifest *AddonManifest, logger *zap.Logger) error {
 	for i, hc := range manifest.Hosts {
 		// 校验 name 非空且无空白字符
@@ -265,18 +252,14 @@ func validateHosts(manifest *AddonManifest, logger *zap.Logger) error {
 			return fmt.Errorf("hosts[%d]: name 不能包含空白字符: %q", i, hc.Name)
 		}
 
-		// 校验 type
 		switch hc.Type {
 		case vhost.HostTypeLocal, vhost.HostTypeRemote:
-			// 合法
 		default:
 			return fmt.Errorf("hosts[%d]: 无效的 type: %s（支持 local/remote）", i, hc.Type)
 		}
 
-		// 校验 priority
 		switch hc.Priority {
 		case vhost.PriorityOverride, vhost.PriorityFallback:
-			// 合法
 		default:
 			return fmt.Errorf("hosts[%d]: 无效的 priority: %s（支持 override/fallback）", i, hc.Priority)
 		}

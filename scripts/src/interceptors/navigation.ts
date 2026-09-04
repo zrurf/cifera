@@ -1,12 +1,10 @@
 /**
- * 导航拦截器
- * 拦截所有页面跳转操作，将 URL 重写为代理 URL
- * 包括：location 赋值、location.href/replace/assign、window.open、<a> 点击等
+ * 导航拦截器：重写所有页面跳转（location 赋值/方法、window.open、<a> 点击、
+ * Navigation API、history.pushState/replaceState）
  */
 
 import { rewriteUrl } from '../rewriter';
 
-// window.open
 const originalWindowOpen = window.open;
 
 window.open = function(url?: string | URL, target?: string, features?: string): Window | null {
@@ -21,14 +19,11 @@ window.open = function(url?: string | URL, target?: string, features?: string): 
     return originalWindowOpen.call(this, url as any, target, features);
 };
 
-// location 赋值拦截
-// location 对象是特殊的，无法直接替换，需要通过拦截属性 setter 来实现
-
-// 保存原始 location 方法
+// location 对象无法整体替换，需拦截各方法/属性的 setter
 const originalReplace = window.Location.prototype.replace;
 const originalAssign = window.Location.prototype.assign;
 
-// 拦截 location.replace()
+// location.replace()
 window.Location.prototype.replace = function(url: string): void {
     try {
         url = rewriteUrl(url);
@@ -38,7 +33,7 @@ window.Location.prototype.replace = function(url: string): void {
     originalReplace.call(this, url);
 };
 
-// 拦截 location.assign()
+// location.assign()
 if (originalAssign) {
     window.Location.prototype.assign = function(url: string): void {
         try {
@@ -50,7 +45,7 @@ if (originalAssign) {
     };
 }
 
-// 拦截 location.href 的 setter
+// location.href setter
 const hrefDescriptor = Object.getOwnPropertyDescriptor(window.Location.prototype, 'href');
 if (hrefDescriptor && hrefDescriptor.set) {
     const originalHrefSetter = hrefDescriptor.set;
@@ -69,26 +64,19 @@ if (hrefDescriptor && hrefDescriptor.set) {
     });
 }
 
-// 拦截对 window.location 整体赋值（如 window.location = "http://..."）
-// 这通过在 window 上定义 location 的 setter 来实现
-// 注意：浏览器中 window.location 是特殊对象，直接赋值等效于设置 href
-// 大多数场景已被 href setter 覆盖，这里处理 window.location = url 的写法
+// window.location 整体赋值无法直接拦截：浏览器中赋值等效于设置 href，已被上方 href setter 覆盖
 try {
     const originalLocation = window.location;
-    // 无法直接重定义 window.location，但赋值 window.location = url 等效于 location.href = url
-    // 已被 href setter 覆盖
+    // （遗留说明：此处无法重定义 window.location，保留占位）
 } catch {
     // 忽略
 }
 
-// <a> 标签点击拦截
-// 拦截所有 <a> 标签的点击事件，改写 href
-// 静态 href 已由 Go 端改写，这里处理动态设置的 href
+// <a> 点击拦截：静态 href 已由 Go 端改写，这里处理动态设置的 href
 document.addEventListener('click', (e: MouseEvent) => {
     const target = e.target as HTMLElement | null;
     if (!target) return;
 
-    // 查找最近的 <a> 祖先
     const anchor = target.closest('a');
     if (!anchor) return;
 
@@ -105,10 +93,9 @@ document.addEventListener('click', (e: MouseEvent) => {
             // 改写失败，允许默认行为
         }
     }
-}, true); // 使用捕获阶段，确保最先处理
+}, true); // 捕获阶段，确保最先处理
 
-// Navigation API 拦截
-// 拦截 Navigation API（现代浏览器支持的 navigate 事件）
+// 拦截 Navigation API 的 navigate 事件（现代浏览器）
 if ('navigation' in window && (window as any).navigation) {
     try {
         (window as any).navigation.addEventListener('navigate', (event: any) => {
@@ -117,9 +104,7 @@ if ('navigation' in window && (window as any).navigation) {
                 if (destinationUrl) {
                     const rewritten = rewriteUrl(destinationUrl);
                     if (rewritten !== destinationUrl) {
-                        // 阻止原始导航
                         event.preventDefault();
-                        // 执行改写后的导航
                         window.location.href = rewritten;
                     }
                 }
@@ -128,12 +113,11 @@ if ('navigation' in window && (window as any).navigation) {
             }
         });
     } catch {
-        // Navigation API 不可用，忽略
+        // Navigation API 不可用，跳过
     }
 }
 
-// history API 拦截
-// 拦截 history.pushState 和 history.replaceState
+// 拦截 history.pushState / replaceState
 const originalPushState = history.pushState.bind(history);
 const originalReplaceState = history.replaceState.bind(history);
 
@@ -163,8 +147,7 @@ history.replaceState = function(data: any, unused: string, url?: string | URL | 
     originalReplaceState(data, unused, url ?? undefined);
 };
 
-// 辅助函数
-// 允许导航改写的协议白名单
+// 导航改写的协议白名单
 const ALLOWED_NAV_SCHEMES = new Set([
     'http', 'https', 'ftp', 'ftps',
 ]);
@@ -173,11 +156,10 @@ function shouldSkipNavUrl(url: string): boolean {
     if (!url || url.trim() === '') return true;
     if (url[0] === '#') return true;
 
-    // 检查是否包含协议前缀（形如 "xxx:"）
     const colonIdx = url.indexOf(':');
     if (colonIdx > 0) {
         const scheme = url.substring(0, colonIdx).toLowerCase();
-        // 只有白名单中的协议才拦截，未知协议（如 jsBridge、weixin 等）跳过
+        // 白名单外协议（jsBridge、weixin 等）不拦截
         if (!ALLOWED_NAV_SCHEMES.has(scheme)) return true;
     }
 

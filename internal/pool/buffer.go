@@ -7,13 +7,12 @@ import (
 )
 
 const (
-	// 小缓冲区默认大小（适合大多数 HTML 响应）
+	// 小缓冲区默认大小
 	smallBufSize = 32 * 1024 // 32KB
-	// 大缓冲区默认大小（适合大页面）
+	// 大缓冲区默认大小
 	largeBufSize = 256 * 1024 // 256KB
 )
 
-// smallBufPool 小缓冲区对象池
 var smallBufPool = sync.Pool{
 	New: func() any {
 		buf := bytes.NewBuffer(make([]byte, 0, smallBufSize))
@@ -21,7 +20,6 @@ var smallBufPool = sync.Pool{
 	},
 }
 
-// largeBufPool 大缓冲区对象池
 var largeBufPool = sync.Pool{
 	New: func() any {
 		buf := bytes.NewBuffer(make([]byte, 0, largeBufSize))
@@ -29,7 +27,7 @@ var largeBufPool = sync.Pool{
 	},
 }
 
-// byteSlicePool 字节切片对象池（用于 io.ReadAll 替代）
+// byteSlicePools 分级字节切片池（用于 io.ReadAll 等读取缓冲）
 var byteSlicePools = [3]sync.Pool{
 	{New: func() any { return make([]byte, 0, 4*1024) }},   // 4KB
 	{New: func() any { return make([]byte, 0, 64*1024) }},  // 64KB
@@ -58,7 +56,7 @@ func PutBuffer(buf *bytes.Buffer) {
 	if buf == nil {
 		return
 	}
-	// 防止内存泄漏：如果缓冲区过大（>1MB），不回收
+	// 超过 1MB 的缓冲区不回收，防止内存泄漏
 	if buf.Cap() > 1024*1024 {
 		return
 	}

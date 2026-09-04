@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,7 +26,7 @@ import (
 var ciferaRuntimeJS string
 
 func main() {
-	// 初始化基础 Logger 以捕获启动阶段的错误
+	// 读取配置前使用基础 Logger
 	logger, err := zap.NewProduction()
 	if err != nil {
 		os.Exit(1)
@@ -39,13 +40,11 @@ func main() {
 	logger = initLog(logger, config.Log)
 	defer logger.Sync()
 
-	// 加载 addon
 	addons, err := addon.LoadAddons(config.Addons.Dir, config.Addons.Enabled, logger)
 	if err != nil {
 		logger.Fatal("加载 addon 失败", zap.Error(err))
 	}
 
-	// 初始化虚拟主机注册表
 	registry := vhost.NewRegistry(logger)
 	if err := registry.LoadFromConfig(config.Hosts); err != nil {
 		logger.Fatal("加载 config 虚拟主机失败", zap.Error(err))
@@ -59,11 +58,9 @@ func main() {
 		}
 	}
 
-	// 初始化压缩协商器
 	var negotiator *compress.Negotiator
 	if config.Compression.Enabled {
-		compressCfg := config.Compression.ToCompressConfig()
-		negotiator = compress.NewNegotiator(compressCfg)
+		negotiator = compress.NewNegotiator(config.Compression.ToCompressConfig())
 		logger.Info("压缩模块已启用",
 			zap.Bool("gzip", config.Compression.Gzip.Enabled),
 			zap.Bool("brotli", config.Compression.Brotli.Enabled),
@@ -73,22 +70,19 @@ func main() {
 		logger.Info("压缩模块已禁用")
 	}
 
-	// 初始化缓存
 	var cch *cache.Cache
 	if config.Cache.Enabled {
 		cch = cache.New(cache.Config{
 			Enabled: true,
 			MaxSize: config.Cache.MaxSize,
 		}, logger)
-		maxSizeMB := config.Cache.MaxSize / (1024 * 1024)
 		logger.Info("缓存模块已启用",
-			zap.Int64("max_size_mb", maxSizeMB),
+			zap.Int64("max_size_mb", config.Cache.MaxSize/(1024*1024)),
 		)
 	} else {
 		logger.Info("缓存模块已禁用")
 	}
 
-	// 初始化 Cookie Jar 管理器
 	var cookieMgr *cookiejar.Manager
 	if config.Cookies.Enabled {
 		cleanupInterval := time.Duration(config.Cookies.CleanupInterval) * time.Second
@@ -96,7 +90,6 @@ func main() {
 			cleanupInterval = 5 * time.Minute
 		}
 
-		var err error
 		cookieMgr, err = cookiejar.NewManager(cookiejar.Config{
 			Enabled:         true,
 			JarCapacity:     config.Cookies.JarCapacity,
@@ -127,24 +120,26 @@ func main() {
 	}
 }
 
+// initConfig 初始化配置，优先级从高到低：命令行 flag > 环境变量 > 配置文件 > 默认值
 func initConfig(logger *zap.Logger) (*internal.Config, error) {
 	var cfg internal.Config
 	initFlag()
-
 	pflag.Parse()
 
-	v := viper.New()
+	// 初始化 Viper 前需要配置文件路径，先从 pflag 手动获取
+	configFile, _ := pflag.CommandLine.GetString("config")
 
+	v := viper.New()
+	syncDefaults(v)
 	setDefaults(v)
 
-	configFile, _ := pflag.CommandLine.GetString("config")
 	v.SetConfigFile(configFile)
-
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			logger.Info("未找到配置文件，将使用默认值和环境变量")
+			logger.Info("未找到配置文件，将使用默认值和环境变量", zap.String("path", configFile))
 		} else {
-			logger.Error("读取配置文件失败", zap.Error(err))
+			// 配置文件存在但解析失败（如 TOML 语法错误），直接报错退出而非静默忽略
+			return nil, fmt.Errorf("读取配置文件 '%s' 失败: %w", configFile, err)
 		}
 	}
 
@@ -152,8 +147,10 @@ func initConfig(logger *zap.Logger) (*internal.Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
+	// 仅绑定用户在命令行显式传入的 flag。
+	// 若无条件绑定，pflag 默认值会覆盖配置文件中的值，导致配置文件失效。
 	pflag.CommandLine.VisitAll(func(f *pflag.Flag) {
-		if f.Name != "config" {
+		if f.Name != "config" && f.Changed {
 			_ = v.BindPFlag(f.Name, f)
 		}
 	})
@@ -165,6 +162,7 @@ func initConfig(logger *zap.Logger) (*internal.Config, error) {
 	return &cfg, nil
 }
 
+// initFlag 定义命令行 flag
 func initFlag() {
 	pflag.String("config", "./config.toml", "配置文件路径")
 	pflag.String("server.listen", ":80", "HTTP 监听地址")
@@ -177,25 +175,19 @@ func initFlag() {
 	pflag.Bool("log.persistent", true, "持久化日志文件")
 }
 
+// syncDefaults 将 pflag 默认值同步为 Viper 默认值，使默认值只定义一次
+func syncDefaults(v *viper.Viper) {
+	pflag.CommandLine.VisitAll(func(f *pflag.Flag) {
+		if f.Name != "config" {
+			v.SetDefault(f.Name, f.DefValue)
+		}
+	})
+}
+
+// setDefaults 设置无对应命令行 flag 的配置项默认值
 func setDefaults(v *viper.Viper) {
-	// Server 默认值
-	v.SetDefault("server.listen", ":80")
-
-	// Log 默认值
-	v.SetDefault("log.level", "info")
-	v.SetDefault("log.path", "./log/latest.log")
-	v.SetDefault("log.persistent", true)
-
-	// Lumberjack 默认值
-	v.SetDefault("log.max_size", 50) // MB
-	v.SetDefault("log.max_backups", 3)
-	v.SetDefault("log.max_age", 7) // days
-	v.SetDefault("log.compression", true)
-
-	// Addons 默认值
 	v.SetDefault("addons.dir", "./addons")
 
-	// Compression 默认值
 	v.SetDefault("compression.enabled", true)
 	v.SetDefault("compression.gzip.enabled", true)
 	v.SetDefault("compression.gzip.level", 5)
@@ -204,18 +196,16 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("compression.zstd.enabled", true)
 	v.SetDefault("compression.zstd.level", 3)
 
-	// Cache 默认值
 	v.SetDefault("cache.enabled", true)
 	v.SetDefault("cache.max_size", 256*1024*1024) // 256MB
 
-	// Cookies 默认值
 	v.SetDefault("cookies.enabled", true)
 	v.SetDefault("cookies.jar_capacity", 500)
 	v.SetDefault("cookies.persist_path", "./data/cookies")
 	v.SetDefault("cookies.cleanup_interval", 300) // 秒
 }
 
-// initLog 根据配置初始化日志系统，返回配置完成后的 logger
+// initLog 根据配置初始化日志系统并替换全局 logger
 func initLog(baseLogger *zap.Logger, config internal.LogConfig) *zap.Logger {
 	var l zapcore.Level
 	if err := l.UnmarshalText([]byte(config.Level)); err != nil {
@@ -238,31 +228,33 @@ func initLog(baseLogger *zap.Logger, config internal.LogConfig) *zap.Logger {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	var core zapcore.Core
-	consoleWriter := zapcore.AddSync(os.Stdout)
 	consoleCore := zapcore.NewCore(
 		zapcore.NewConsoleEncoder(encoderConfig),
-		consoleWriter,
+		zapcore.AddSync(os.Stdout),
 		l,
 	)
 
+	core := consoleCore
 	if config.Persistent {
-		lumberJackLogger := &lumberjack.Logger{
-			Filename:   config.Path,
-			MaxSize:    config.MaxSize,
-			MaxBackups: config.MaxBackups,
-			MaxAge:     config.MaxAge,
-			Compress:   config.Compression,
+		// 确保日志目录存在，创建失败则退化为仅控制台输出
+		logDir := filepath.Dir(config.Path)
+		if err := os.MkdirAll(logDir, 0755); err != nil {
+			baseLogger.Error("创建日志目录失败，仅使用控制台输出", zap.String("path", logDir), zap.Error(err))
+		} else {
+			lumberJackLogger := &lumberjack.Logger{
+				Filename:   config.Path,
+				MaxSize:    config.MaxSize,
+				MaxBackups: config.MaxBackups,
+				MaxAge:     config.MaxAge,
+				Compress:   config.Compression,
+			}
+			fileCore := zapcore.NewCore(
+				zapcore.NewJSONEncoder(encoderConfig),
+				zapcore.AddSync(lumberJackLogger),
+				l,
+			)
+			core = zapcore.NewTee(fileCore, consoleCore)
 		}
-		fileWriter := zapcore.AddSync(lumberJackLogger)
-		fileCore := zapcore.NewCore(
-			zapcore.NewJSONEncoder(encoderConfig),
-			fileWriter,
-			l,
-		)
-		core = zapcore.NewTee(fileCore, consoleCore)
-	} else {
-		core = consoleCore
 	}
 
 	newLogger := zap.New(

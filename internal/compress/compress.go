@@ -1,5 +1,5 @@
 // Package compress 提供响应压缩功能，支持 gzip、brotli、zstd
-// 压缩优先级：zstd > brotli > gzip（基于客户端 Accept-Encoding 协商）
+// 客户端同时接受多种编码时，协商优先级为 zstd > brotli > gzip
 package compress
 
 import (
@@ -71,12 +71,10 @@ func NewNegotiator(cfg Config) *Negotiator {
 		return n
 	}
 
-	// 确保 algos 不为 nil
 	if n.algos == nil {
 		n.algos = DefaultConfig().Algos
 	}
 
-	// 初始化 writer 池
 	n.gzipWriters = sync.Pool{
 		New: func() any {
 			w, _ := gzip.NewWriterLevel(io.Discard, n.getLevel(Gzip))
@@ -139,7 +137,7 @@ func (n *Negotiator) getBuf() *bytes.Buffer {
 }
 
 func (n *Negotiator) putBuf(buf *bytes.Buffer) {
-	if buf.Cap() > 4*1024*1024 { // >4MB 不回收
+	if buf.Cap() > 4*1024*1024 { // 超过 4MB 不回收，防止大缓冲滞留内存
 		return
 	}
 	buf.Reset()
@@ -153,7 +151,6 @@ func (n *Negotiator) Negotiate(acceptEncoding string) Algorithm {
 		return ""
 	}
 
-	// 解析 Accept-Encoding，检查各算法的支持情况
 	// Accept-Encoding 格式：gzip, deflate, br;q=1.0, zstd;q=0.9
 	bestAlgo := Algorithm("")
 	bestQ := float64(-1)
@@ -164,12 +161,10 @@ func (n *Negotiator) Negotiate(acceptEncoding string) Algorithm {
 			continue
 		}
 
-		// 分离算法名和 q 值
 		var algoName string
 		q := 1.0
 		if before, after, ok := strings.Cut(part, ";"); ok {
 			algoName = strings.TrimSpace(before)
-			// 解析 q 值
 			params := after
 			if strings.Contains(params, "q=") {
 				qStart := strings.Index(params, "q=") + 2
@@ -186,7 +181,6 @@ func (n *Negotiator) Negotiate(acceptEncoding string) Algorithm {
 			algoName = part
 		}
 
-		// 将客户端算法名映射到我们的 Algorithm 类型
 		var algo Algorithm
 		switch algoName {
 		case "zstd":
@@ -341,40 +335,36 @@ func (n *Negotiator) CompressResponse(resp *http.Response, origReq *http.Request
 		return nil
 	}
 
-	// 已有 Content-Encoding，跳过（可能来自上游的压缩透传）
+	// 已有 Content-Encoding（如上游已压缩透传），跳过
 	if resp.Header.Get("Content-Encoding") != "" {
 		return nil
 	}
 
-	// 无 body，跳过
 	if resp.Body == nil {
 		return nil
 	}
 
-	// 协商压缩算法
 	acceptEncoding := origReq.Header.Get("Accept-Encoding")
 	algo := n.Negotiate(acceptEncoding)
 	if algo == "" {
 		return nil
 	}
 
-	// 读取 body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
 
-	// 小于 1400 字节不压缩（压缩反而可能增大，且节省有限）
+	// 小于 1400 字节不压缩：收益有限且可能反而更大
 	if len(body) < 1400 {
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
 	}
 
-	// 压缩
 	compressed, err := n.Compress(body, algo)
 	if err != nil {
-		// 压缩失败，回退到未压缩
+		// 压缩失败，回退为原始响应
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return err
 	}
@@ -385,13 +375,12 @@ func (n *Negotiator) CompressResponse(resp *http.Response, origReq *http.Request
 		return nil
 	}
 
-	// 更新响应
 	resp.Body = io.NopCloser(bytes.NewReader(compressed))
 	resp.ContentLength = int64(len(compressed))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(compressed)))
 	resp.Header.Set("Content-Encoding", string(algo))
 	resp.Header.Add("Vary", "Accept-Encoding")
-	// 删除可能冲突的头部
+	// 移除 Transfer-Encoding，避免与 Content-Encoding 冲突
 	resp.Header.Del("Transfer-Encoding")
 
 	return nil

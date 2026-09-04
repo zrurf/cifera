@@ -38,8 +38,8 @@ var allowedSchemes = map[string]bool{
 	"wss":   true,
 }
 
-// shouldSkipUrl 判断 URL 是否不需要代理改写
-// 使用白名单模式：仅改写已知协议的绝对 URL，未知协议不拦截
+// shouldSkipUrl 判断 URL 是否跳过代理改写
+// 白名单模式：仅改写已知协议的 URL，未知协议不拦截
 func shouldSkipUrl(u string) bool {
 	if u == "" {
 		return true
@@ -49,12 +49,9 @@ func shouldSkipUrl(u string) bool {
 		return true
 	}
 
-	// 检查是否包含协议前缀（形如 "xxx:"）
 	colonIdx := strings.Index(u, ":")
 	if colonIdx > 0 {
-		// 提取协议部分
 		scheme := strings.ToLower(u[:colonIdx])
-		// 只有白名单中的协议才改写，未知协议（如 jsBridge、weixin 等自定义协议）跳过
 		if !allowedSchemes[scheme] {
 			return true
 		}
@@ -64,17 +61,13 @@ func shouldSkipUrl(u string) bool {
 }
 
 // BuildProxyUrl 将原始 URL 转换为代理 URL
-// proxyBase: 代理入口的基础 URL（如 http://127.0.0.1:8080）
-// originalUrl: 需要改写的原始 URL（可以是绝对、相对、协议相对）
-// currentPath: 当前请求的路径（用于解析相对 URL）
-// host: 目标 host
-// schema: 目标 scheme
+// proxyBase: 代理入口地址；currentPath: 当前请求路径（解析相对 URL 用）
+// originalUrl: 原始 URL（绝对/相对/协议相对）；host/schema: 目标主机与协议
 func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema string) string {
 	if shouldSkipUrl(originalUrl) {
 		return originalUrl
 	}
 
-	// 已包含代理参数，跳过
 	if ContainsCiferaParam(originalUrl) {
 		return originalUrl
 	}
@@ -99,8 +92,7 @@ func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema string) str
 			targetSchema = "http"
 		}
 	default:
-		// 相对路径：/img.png, ./img.png, ../img.png
-		// 基于当前路径解析为绝对 URL，然后追加代理参数
+		// 相对路径：基于当前路径解析为绝对 URL，再追加代理参数
 		base, baseErr := url.Parse(proxyBase + currentPath)
 		if baseErr != nil {
 			return originalUrl
@@ -115,17 +107,15 @@ func BuildProxyUrl(proxyBase, originalUrl, currentPath, host, schema string) str
 		return resolved.String()
 	}
 
-	// 绝对或协议相对 URL：重写为代理 URL
 	proxyURL, err := url.Parse(proxyBase)
 	if err != nil {
 		return originalUrl
 	}
 
-	// 设置路径（不含查询参数）
 	proxyURL.Path = origURL.Path
 	proxyURL.RawPath = origURL.RawPath
 
-	// 合并查询参数：先原始参数，再代理参数
+	// 合并查询参数：先保留原始参数，再追加代理参数
 	q := proxyURL.Query()
 	for key, vals := range origURL.Query() {
 		for _, v := range vals {

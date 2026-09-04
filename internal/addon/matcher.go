@@ -2,8 +2,7 @@ package addon
 
 import "sync"
 
-// MatchBlock 匹配 block 规则，返回首个匹配项
-// 短路逻辑：首个匹配即返回，无需并行
+// MatchBlock 匹配 block 规则，返回首个匹配项（短路）
 func MatchBlock(addons []*LoadedAddon, originalURL string) *MatchResult {
 	for _, a := range addons {
 		for i := range a.Manifest.Rules {
@@ -19,8 +18,7 @@ func MatchBlock(addons []*LoadedAddon, originalURL string) *MatchResult {
 	return nil
 }
 
-// MatchReplace 匹配 replace 或 replace_content 规则，返回首个匹配项
-// 短路逻辑：首个匹配即返回，无需并行
+// MatchReplace 匹配 replace 或 replace_content 规则，返回首个匹配项（短路）
 func MatchReplace(addons []*LoadedAddon, originalURL string) *MatchResult {
 	for _, a := range addons {
 		for i := range a.Manifest.Rules {
@@ -37,7 +35,7 @@ func MatchReplace(addons []*LoadedAddon, originalURL string) *MatchResult {
 }
 
 // MatchInject 匹配所有 inject 规则，返回所有匹配项（可叠加注入）
-// 当 addon 数量 >= 3 时使用并发匹配，否则顺序匹配（避免 goroutine 开销）
+// addon 数 >= 3 时并发匹配，否则顺序匹配，避免小规模下的 goroutine 开销
 func MatchInject(addons []*LoadedAddon, originalURL string) []InjectItem {
 	if len(addons) < 3 {
 		return matchInjectSequential(addons, originalURL)
@@ -65,7 +63,6 @@ func matchInjectSequential(addons []*LoadedAddon, originalURL string) []InjectIt
 }
 
 // matchInjectConcurrent 并发匹配 inject 规则
-// 每个 addon 在独立 goroutine 中匹配，最后合并结果
 func matchInjectConcurrent(addons []*LoadedAddon, originalURL string) []InjectItem {
 	type addonResult struct {
 		items []InjectItem

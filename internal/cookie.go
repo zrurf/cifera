@@ -8,8 +8,7 @@ import (
 	"time"
 )
 
-// extractSetCookies extracts all Set-Cookie headers from the response,
-// returns them as []*http.Cookie, and removes Set-Cookie headers from the response.
+// extractSetCookies 提取响应中所有 Set-Cookie 头，返回 []*http.Cookie，并从响应中移除
 func extractSetCookies(resp *http.Response) []*http.Cookie {
 	rawCookies := resp.Header.Values("Set-Cookie")
 	if len(rawCookies) == 0 {
@@ -25,14 +24,12 @@ func extractSetCookies(resp *http.Response) []*http.Cookie {
 		result = append(result, cookie)
 	}
 
-	// Remove all Set-Cookie headers from the response
 	resp.Header.Del("Set-Cookie")
 
 	return result
 }
 
-// buildCookieHeader builds a Cookie header value from a list of cookies.
-// The format is "name1=value1; name2=value2; ..."
+// buildCookieHeader 从 cookie 列表构建 Cookie 头，格式为 "name1=value1; name2=value2; ..."
 func buildCookieHeader(cookies []*http.Cookie) string {
 	if len(cookies) == 0 {
 		return ""
@@ -45,18 +42,17 @@ func buildCookieHeader(cookies []*http.Cookie) string {
 	return strings.Join(parts, "; ")
 }
 
-// cookieSyncEntry is the JSON format for Cifera-Cookie-Sync header
+// cookieSyncEntry 是 Cifera-Cookie-Sync 头使用的 JSON 条目格式
 type cookieSyncEntry struct {
 	N string `json:"n"` // name
 	V string `json:"v"` // value
 	P string `json:"p"` // path
-	E int64  `json:"e"` // expires (unix timestamp, 0 = session)
+	E int64  `json:"e"` // 过期时间（unix 秒，0 为会话 cookie）
 	S bool   `json:"s"` // secure
 	H bool   `json:"h"` // httponly
 }
 
-// decodeCookieSyncHeader decodes the Cifera-Cookie-Sync header value
-// Format: base64(JSON array of cookieSyncEntry)
+// decodeCookieSyncHeader 解码 Cifera-Cookie-Sync 头值（base64 编码的 cookieSyncEntry JSON 数组）
 func decodeCookieSyncHeader(headerValue string) ([]*http.Cookie, error) {
 	data, err := base64.StdEncoding.DecodeString(headerValue)
 	if err != nil {
@@ -89,7 +85,7 @@ func decodeCookieSyncHeader(headerValue string) ([]*http.Cookie, error) {
 	return cookies, nil
 }
 
-// buildCookiesJSON builds a JSON string from cookies in the cookieSyncEntry format
+// buildCookiesJSON 将 cookie 序列化为 cookieSyncEntry 格式的 JSON 字符串
 func buildCookiesJSON(cookies []*http.Cookie) string {
 	entries := make([]cookieSyncEntry, len(cookies))
 	for i, c := range cookies {
@@ -111,9 +107,7 @@ func buildCookiesJSON(cookies []*http.Cookie) string {
 	return string(data)
 }
 
-// buildCookiePushHeader 构建 Cifera-Cookie-Push 头的值
-// 格式与 Cifera-Cookie-Sync 一致：base64(JSON array of cookieSyncEntry)
-// 支持墓碑标记（e = -1）：当 Set-Cookie 的 MaxAge < 0 时表示删除该 cookie
+// buildCookiePushHeader 构建 Cifera-Cookie-Push 头值（格式与 Cifera-Cookie-Sync 一致，e=-1 表示删除）
 func buildCookiePushHeader(cookies []*http.Cookie) string {
 	entries := make([]cookieSyncEntry, 0, len(cookies))
 	for _, c := range cookies {
@@ -128,7 +122,6 @@ func buildCookiePushHeader(cookies []*http.Cookie) string {
 			entry.P = "/"
 		}
 		if c.MaxAge < 0 {
-			// 删除标记（墓碑）
 			entry.E = -1
 		} else if !c.Expires.IsZero() {
 			entry.E = c.Expires.Unix()
