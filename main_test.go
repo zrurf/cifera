@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/zrurf/cifera/internal"
+	"github.com/zrurf/cifera/internal/addon"
 	"go.uber.org/zap"
 )
 
@@ -87,5 +91,72 @@ func TestConfigParseErrorFails(t *testing.T) {
 	_, err := initConfigForTest(t, []string{"--config", badPath})
 	if err == nil {
 		t.Fatal("TOML 语法错误的配置文件应返回错误")
+	}
+}
+
+// 回归测试：watchAddonsDir 必须随 ctx 取消返回。
+// 该函数曾是 main 中的同步调用，导致进程卡在监听循环、服务永不启动。
+func TestWatchAddonsDirStopsOnContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	writeTestAddon(t, dir, "demo.cifera")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	reloaded := make(chan []*addon.LoadedAddon, 1)
+
+	go func() {
+		defer close(done)
+		watchAddonsDir(ctx, dir, nil, nil, func(a []*addon.LoadedAddon) {
+			select {
+			case reloaded <- a:
+			default:
+			}
+		}, zap.NewNop())
+	}()
+
+	// 变更目录内容触发一次热重载；fsnotify 监听可能晚于测试写入，
+	// 故在超时前重复触发，避免依赖固定 sleep 造成偶发失败
+	var loaded []*addon.LoadedAddon
+	deadline := time.After(15 * time.Second)
+	for loaded == nil {
+		writeTestAddon(t, dir, "second.cifera")
+		select {
+		case got := <-reloaded:
+			if len(got) == 2 {
+				loaded = got
+			}
+		case <-time.After(2 * time.Second):
+		case <-deadline:
+			t.Fatal("超时未收到热重载回调")
+		}
+	}
+
+	seen := make(map[string]bool, len(loaded))
+	for _, a := range loaded {
+		seen[a.Manifest.Addon.ID] = true
+	}
+	if !seen["demo.cifera"] || !seen["second.cifera"] {
+		t.Fatalf("热重载结果缺少预期 addon: %v", seen)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ctx 取消后 watchAddonsDir 未返回")
+	}
+}
+
+// writeTestAddon 在 dir 下写入一个指定 id 的最小可加载 addon
+func writeTestAddon(t *testing.T, dir, id string) {
+	t.Helper()
+	addonDir := filepath.Join(dir, strings.Split(id, ".")[0])
+	if err := os.MkdirAll(addonDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "[addon]\nid = \"" + id + "\"\nname = \"Test\"\nversion = \"1.0.0\"\n\n" +
+		"[[rules]]\npattern = [\"example\\\\.com/.*\"]\naction = \"block\"\nstatus_code = 404\n"
+	if err := os.WriteFile(filepath.Join(addonDir, "addon.toml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

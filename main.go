@@ -136,12 +136,16 @@ func main() {
 		logger.Info("注册租户已启用", zap.Int("count", len(regs)))
 	}
 
-	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch, cookieMgr, config.Server.APIHost, tstore)
+	handler := internal.CreateServer(logger, ciferaRuntimeJS, addons, registry, negotiator, cch, cookieMgr, config.Server.APIHost, config.Server.Listen, tstore)
 
-	// addon 热加载：目录存在时监听变更并自动重新加载
+	// 监听退出信号，触发停机
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// addon 热加载：目录存在时在后台监听变更并自动重新加载，不阻塞服务启动
 	if stat, err := os.Stat(config.Addons.Dir); err == nil && stat.IsDir() {
 		if reloader, ok := handler.(interface{ ReplaceAddons([]*addon.LoadedAddon) }); ok {
-			watchAddonsDir(config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, reloader.ReplaceAddons, logger)
+			go watchAddonsDir(ctx, config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, reloader.ReplaceAddons, logger)
 		}
 	}
 
@@ -152,10 +156,6 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
-
-	// 监听退出信号，触发停机
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		var err error
@@ -338,8 +338,8 @@ func initLog(baseLogger *zap.Logger, config internal.LogConfig) *zap.Logger {
 	return newLogger
 }
 
-// watchAddonsDir 监听 addon 目录及其一级子目录，变更后防抖触发重载
-func watchAddonsDir(dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
+// watchAddonsDir 监听 addon 目录及其一级子目录，变更后防抖触发重载；ctx 取消时退出
+func watchAddonsDir(ctx context.Context, dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		logger.Warn("初始化 addon 热加载失败", zap.Error(err))
@@ -373,6 +373,9 @@ func watchAddonsDir(dir string, enabled []string, globalParams map[string]map[st
 
 	for {
 		select {
+		case <-ctx.Done():
+			logger.Info("addon 热加载已停止")
+			return
 		case ev, ok := <-w.Events:
 			if !ok {
 				return

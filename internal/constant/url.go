@@ -11,6 +11,9 @@ const MetaHeaderPrefix = "Cifera-"
 // Cifera-Referer 头：携带当前页面原始 URL
 const HeaderReferer = "Cifera-Referer"
 
+// Max-Forwards 头（RFC 9110）：转发跳数，每跳递减，用于终止多实例互指形成的转发环路
+const HeaderMaxForwards = "Max-Forwards"
+
 // Cifera-Cookie-Sync 头：客户端 JS 修改的脏 cookie 同步到服务端 Cookie Jar
 const HeaderCookieSync = "Cifera-Cookie-Sync"
 

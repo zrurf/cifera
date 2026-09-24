@@ -39,6 +39,7 @@ type proxyParams struct {
 	entryScheme string // 代理入口自身的 scheme
 	referer     string // 当前页面原始 URL，转发给源站的 Referer 头
 	currentPath string // 当前请求路径（用于相对 URL 解析）
+	maxForwards int    // 出站请求携带的剩余转发跳数；< 0 表示已耗尽，不得转发
 }
 
 type ctxKey string
@@ -89,7 +90,8 @@ func newOptimizedTransport() *http.Transport {
 // addons: 已加载的 addon；registry: 虚拟主机注册表
 // negotiator/cch/cookieMgr/tstore 可为 nil，分别表示不压缩、不缓存、不启用 Cookie Jar、不启用注册租户
 // apiHost 为内置 API vhost 的保留主机名，空表示不启用 API vhost
-func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache, cookieMgr *cookiejar.Manager, apiHost string, tstore *tenant.Store) http.Handler {
+// listen 为代理自身监听地址，用于回环防护（判定目标是否指向自己）
+func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAddon, registry *vhost.Registry, negotiator *compress.Negotiator, cch *cache.Cache, cookieMgr *cookiejar.Manager, apiHost string, listen string, tstore *tenant.Store) http.Handler {
 	h := &ciferaHandler{
 		addons:      addons,
 		registry:    registry,
@@ -102,6 +104,7 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 		tenantStore: tstore,
 		apiHost:     apiHost,
 		apiVhost:    apivhost.New(cookieMgr, tstore, logger),
+		loopGuard:   newLoopGuard(listen),
 		sem:         make(chan struct{}, 4096), // 最多 4096 个并发代理请求
 	}
 
@@ -143,6 +146,9 @@ func CreateServer(logger *zap.Logger, runtimeJS string, addons []*addon.LoadedAd
 
 			// 移除所有 Cifera-* 头，避免泄漏到源服务器
 			utils.StripMetaHeaders(r.Out.Header)
+
+			// 跳数保护：写入递减后的 Max-Forwards，环路上每跳递减直至被拒绝
+			r.Out.Header.Set(constant.HeaderMaxForwards, strconv.Itoa(max(params.maxForwards, 0)))
 
 			// 移除 _cifera_sid cookie（Cookie Jar 模式已替换为 jar 中的 cookie，此为双重保险）
 			if cookieHeader := r.Out.Header.Get("Cookie"); cookieHeader != "" {
@@ -254,6 +260,7 @@ type ciferaHandler struct {
 	tenantStore *tenant.Store     // 注册租户配置（addon 参数 / enabled_addons），可为 nil
 	apiHost     string            // 内置 API vhost 保留主机名；空则不启用
 	apiVhost    *apivhost.Handler // 内置 API 处理器
+	loopGuard   *loopGuard        // 回环防护：判定目标是否指向本代理自身
 	// 并发控制信号量，限制同时处理的代理请求数
 	sem chan struct{}
 	// addonsMu 保护 addons 字段，支持热加载时的原子替换
@@ -439,6 +446,28 @@ func (h *ciferaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			rc.Tenant = t
 		}
 		h.apiVhost.ServeHTTP(w, r, rc)
+		return
+	}
+
+	// 回环防护：目标指向本代理自身监听端口时，转发会让请求重新进入本进程，
+	// 每跳新增连接与请求头，连接数与内存随跳数放大，故直接拒绝
+	if params.host != "" && h.loopGuard.IsSelf(r.Context(), params.host, params.schema) {
+		h.logger.Warn("目标指向代理自身，拒绝转发以避免回环放大",
+			zap.String("host", params.host),
+			zap.String("path", r.URL.Path),
+		)
+		http.Error(w, "Loop detected", http.StatusLoopDetected)
+		return
+	}
+
+	// 跳数保护：地址判定无法覆盖多实例互指（A→B→A）的环路，用跳数上限兜底
+	if params.maxForwards < 0 {
+		h.logger.Warn("转发跳数已耗尽，拒绝继续转发",
+			zap.String("host", params.host),
+			zap.String("path", r.URL.Path),
+			zap.String("max_forwards", r.Header.Get(constant.HeaderMaxForwards)),
+		)
+		http.Error(w, "Loop detected", http.StatusLoopDetected)
 		return
 	}
 
@@ -884,6 +913,7 @@ func parseProxyParams(r *http.Request, logger *zap.Logger) *proxyParams {
 		entryScheme: entryScheme,
 		referer:     referer,
 		currentPath: currentPath,
+		maxForwards: nextMaxForwards(r.Header.Get(constant.HeaderMaxForwards)),
 	}
 }
 
