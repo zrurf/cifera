@@ -13,22 +13,30 @@ import (
 	"go.uber.org/zap"
 )
 
+// LoadReport 一次 addon 目录加载的结果
+type LoadReport struct {
+	Addons []*LoadedAddon // 成功加载的 addon
+	// Failed 因解析、参数、编译或校验失败被跳过的 addon 数量。
+	// 热加载依据它区分「目录为空」与「目录处于构建中间态」：前者应清空运行时列表，后者不应。
+	Failed int
+}
+
 // LoadAddons 从指定目录加载 addon
 // enabled 为空时加载全部，否则仅加载其中指定的 addon ID
 // globalParams：按 addon ID 分组的关键参数值（来自 config 的 addons.params）
-func LoadAddons(dir string, enabled []string, globalParams map[string]map[string]any, logger *zap.Logger) ([]*LoadedAddon, error) {
+func LoadAddons(dir string, enabled []string, globalParams map[string]map[string]any, logger *zap.Logger) (LoadReport, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
-		return nil, fmt.Errorf("解析 addon 目录路径失败: %w", err)
+		return LoadReport{}, fmt.Errorf("解析 addon 目录路径失败: %w", err)
 	}
 
 	entries, err := os.ReadDir(absDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			logger.Info("addon 目录不存在，跳过加载", zap.String("dir", absDir))
-			return nil, nil
+			return LoadReport{}, nil
 		}
-		return nil, fmt.Errorf("读取 addon 目录失败: %w", err)
+		return LoadReport{}, fmt.Errorf("读取 addon 目录失败: %w", err)
 	}
 
 	enabledSet := make(map[string]bool)
@@ -36,7 +44,7 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 		enabledSet[id] = true
 	}
 
-	var addons []*LoadedAddon
+	var report LoadReport
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -58,6 +66,7 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 				zap.String("path", manifestPath),
 				zap.Error(err),
 			)
+			report.Failed++
 			continue
 		}
 
@@ -77,6 +86,7 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 				zap.String("id", manifest.Addon.ID),
 				zap.Error(err),
 			)
+			report.Failed++
 			continue
 		}
 
@@ -86,6 +96,7 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 				zap.String("id", manifest.Addon.ID),
 				zap.Error(err),
 			)
+			report.Failed++
 			continue
 		}
 
@@ -94,6 +105,7 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 				zap.String("id", manifest.Addon.ID),
 				zap.Error(err),
 			)
+			report.Failed++
 			continue
 		}
 
@@ -102,10 +114,11 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 				zap.String("id", manifest.Addon.ID),
 				zap.Error(err),
 			)
+			report.Failed++
 			continue
 		}
 
-		addons = append(addons, &LoadedAddon{
+		report.Addons = append(report.Addons, &LoadedAddon{
 			Manifest:        *manifest,
 			Dir:             addonDir,
 			Params:          params,
@@ -123,7 +136,7 @@ func LoadAddons(dir string, enabled []string, globalParams map[string]map[string
 		)
 	}
 
-	return addons, nil
+	return report, nil
 }
 
 // parseManifest 解析 addon.toml 文件

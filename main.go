@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"fmt"
+	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -46,10 +49,11 @@ func main() {
 	logger = initLog(logger, config.Log)
 	defer logger.Sync()
 
-	addons, err := addon.LoadAddons(config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, logger)
+	addonReport, err := addon.LoadAddons(config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, logger)
 	if err != nil {
 		logger.Fatal("加载 addon 失败", zap.Error(err))
 	}
+	addons := addonReport.Addons
 
 	registry := vhost.NewRegistry(logger)
 	if err := registry.LoadFromConfig(config.Hosts); err != nil {
@@ -142,30 +146,37 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// addon 热加载：目录存在时在后台监听变更并自动重新加载，不阻塞服务启动
+	// addon 热加载：目录存在时启用。建立监听只做系统调用、同步完成，事件循环在后台运行，
+	// 因此目录监听不会阻塞服务启动；日志顺序也固定为「热加载已启用」先于「服务启动」，
+	// 避免再出现「日志停在 addon 相关行、看不出服务是否已启动」的误判。
 	if stat, err := os.Stat(config.Addons.Dir); err == nil && stat.IsDir() {
 		if reloader, ok := handler.(interface{ ReplaceAddons([]*addon.LoadedAddon) }); ok {
-			go watchAddonsDir(ctx, config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, reloader.ReplaceAddons, logger)
+			watcher, err := newAddonWatcher(config.Addons.Dir, config.Addons.Enabled, config.Addons.Params, reloader.ReplaceAddons, logger)
+			if err != nil {
+				logger.Warn("addon 热加载未启用", zap.String("dir", config.Addons.Dir), zap.Error(err))
+			} else {
+				go watcher.run(ctx)
+			}
 		}
+	}
+
+	// 先完成端口绑定再宣告启动：日志中的「服务启动」即代表端口已就绪
+	ln, err := listen(config.Server)
+	if err != nil {
+		logger.Fatal("服务启动失败", zap.Error(err))
 	}
 
 	// 慢请求防护：限制请求头读取时间与空闲连接保留时间
 	srv := &http.Server{
-		Addr:              config.Server.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {
-		var err error
-		if config.Server.TLSCert != "" && config.Server.TLSKey != "" {
-			err = srv.ListenAndServeTLS(config.Server.TLSCert, config.Server.TLSKey)
-		} else {
-			err = srv.ListenAndServe()
-		}
+		err := srv.Serve(ln)
 		if err != nil && err != http.ErrServerClosed {
-			logger.Fatal("服务启动失败", zap.Error(err))
+			logger.Fatal("服务异常退出", zap.Error(err))
 		}
 	}()
 
@@ -181,6 +192,24 @@ func main() {
 	if cch != nil {
 		cch.Close()
 	}
+}
+
+// listen 创建监听器：配置了证书与私钥时返回 TLS 监听器
+func listen(config internal.ServerConfig) (net.Listener, error) {
+	if config.TLSCert == "" || config.TLSKey == "" {
+		return net.Listen("tcp", config.Listen)
+	}
+
+	cert, err := tls.LoadX509KeyPair(config.TLSCert, config.TLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("加载 TLS 证书失败: %w", err)
+	}
+
+	// NextProtos 与 http.Server.ServeTLS 的默认值保持一致，保留 HTTP/2 支持
+	return tls.Listen("tcp", config.Listen, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
 }
 
 // initConfig 初始化配置，优先级从高到低：命令行 flag > 环境变量 > 配置文件 > 默认值
@@ -338,81 +367,152 @@ func initLog(baseLogger *zap.Logger, config internal.LogConfig) *zap.Logger {
 	return newLogger
 }
 
-// watchAddonsDir 监听 addon 目录及其一级子目录，变更后防抖触发重载；ctx 取消时退出
-func watchAddonsDir(ctx context.Context, dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
+// reloadDebounce 目录变更防抖时长：多次变更合并为一次重载
+const reloadDebounce = 500 * time.Millisecond
+
+// addonWatcher 监听 addon 目录树上的变更
+type addonWatcher struct {
+	dir     string
+	enabled []string
+	params  map[string]map[string]any
+	replace func([]*addon.LoadedAddon)
+	logger  *zap.Logger
+
+	w       *fsnotify.Watcher
+	watched map[string]bool // 已加入监听的目录（绝对路径），避免重复 Add
+}
+
+// newAddonWatcher 建立对 addon 目录及其各级子目录的监听。
+// 只做建立监听所需的系统调用，事件循环交由 run 在后台执行，
+// 因此目录监听不会阻塞服务启动。
+func newAddonWatcher(dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) (*addonWatcher, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		logger.Warn("初始化 addon 热加载失败", zap.Error(err))
-		return
+		return nil, fmt.Errorf("创建文件监听器失败: %w", err)
 	}
-	defer w.Close()
 
-	if err := w.Add(dir); err != nil {
-		logger.Warn("监听 addon 目录失败", zap.String("dir", dir), zap.Error(err))
-		return
+	watcher := &addonWatcher{
+		dir:     dir,
+		enabled: enabled,
+		params:  globalParams,
+		replace: replace,
+		logger:  logger,
+		w:       w,
+		watched: make(map[string]bool),
 	}
-	watchAddonsSubdirs(w, dir)
-	logger.Info("addon 热加载已启用", zap.String("dir", dir))
+
+	if err := watcher.addTree(dir); err != nil {
+		w.Close()
+		return nil, err
+	}
+
+	// 目录树全部纳入监听后输出该日志，保证它出现在「服务启动」之前
+	logger.Info("addon 热加载已启用",
+		zap.String("dir", dir),
+		zap.Int("watched_dirs", len(watcher.watched)),
+	)
+	return watcher, nil
+}
+
+// addTree 把 root 及其全部子目录（任意层级）加入监听。
+// addon 资源常位于多级子目录（如 dist/），只监听一级目录会漏掉这些资源文件的变更。
+// root 自身加入失败视为错误，子目录失败仅记录：子目录可能在遍历过程中被删除。
+func (aw *addonWatcher) addTree(root string) error {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("解析 addon 目录路径失败: %w", err)
+	}
+
+	return filepath.WalkDir(absRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		// 无法访问的目录跳过；root 本身失败则整体失败（此时 entry 可能为 nil）
+		if walkErr != nil {
+			if path == absRoot {
+				return fmt.Errorf("监听 addon 目录失败: %w", walkErr)
+			}
+			aw.logger.Debug("跳过无法访问的 addon 子目录", zap.String("path", path), zap.Error(walkErr))
+			return nil
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		if aw.watched[path] {
+			return nil
+		}
+		if err := aw.w.Add(path); err != nil {
+			if path == absRoot {
+				return fmt.Errorf("监听 addon 目录失败: %w", err)
+			}
+			aw.logger.Debug("监听 addon 子目录失败", zap.String("path", path), zap.Error(err))
+			return nil
+		}
+		aw.watched[path] = true
+		return nil
+	})
+}
+
+// run 处理监听事件：变更后防抖触发一次重载；ctx 取消时退出
+func (aw *addonWatcher) run(ctx context.Context) {
+	defer aw.w.Close()
 
 	var mu sync.Mutex
 	var timer *time.Timer
-	// 防抖：多次变更合并为一次重载
 	poke := func() {
 		mu.Lock()
 		defer mu.Unlock()
 		if timer != nil {
 			return
 		}
-		timer = time.AfterFunc(500*time.Millisecond, func() {
+		timer = time.AfterFunc(reloadDebounce, func() {
 			mu.Lock()
 			timer = nil
 			mu.Unlock()
-			reloadAddons(dir, enabled, globalParams, replace, logger)
+			aw.reload()
 		})
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("addon 热加载已停止")
+			aw.logger.Info("addon 热加载已停止")
 			return
-		case ev, ok := <-w.Events:
+		case ev, ok := <-aw.w.Events:
 			if !ok {
 				return
 			}
+			// 新建目录（含多级）需纳入监听，否则其内部变更不会触发重载
 			if info, err := os.Stat(ev.Name); err == nil && info.IsDir() {
-				_ = w.Add(ev.Name)
+				_ = aw.addTree(ev.Name)
 			}
 			poke()
-		case err, ok := <-w.Errors:
+		case err, ok := <-aw.w.Errors:
 			if !ok {
 				return
 			}
-			logger.Debug("addon 目录监听异常", zap.Error(err))
+			aw.logger.Debug("addon 目录监听异常", zap.Error(err))
 		}
 	}
 }
 
-// watchAddonsSubdirs 将 addon 目录下的一级子目录加入监听
-func watchAddonsSubdirs(w *fsnotify.Watcher, dir string) {
-	entries, err := os.ReadDir(dir)
+// reload 重新加载 addon 并原子替换运行时列表
+func (aw *addonWatcher) reload() {
+	report, err := addon.LoadAddons(aw.dir, aw.enabled, aw.params, aw.logger)
 	if err != nil {
+		aw.logger.Error("addon 热加载失败", zap.Error(err))
 		return
 	}
-	for _, e := range entries {
-		if e.IsDir() {
-			_ = w.Add(filepath.Join(dir, e.Name()))
-		}
-	}
-}
 
-// reloadAddons 重新加载 addon 并原子替换运行时列表
-func reloadAddons(dir string, enabled []string, globalParams map[string]map[string]any, replace func([]*addon.LoadedAddon), logger *zap.Logger) {
-	addons, err := addon.LoadAddons(dir, enabled, globalParams, logger)
-	if err != nil {
-		logger.Error("addon 热加载失败", zap.Error(err))
+	// 目录处于构建中间态时（如 addon 资源文件正在重建）加载会失败，
+	// 此时清空运行时列表会让服务在没有 addon 的状态下继续运行，故保留现有列表
+	if len(report.Addons) == 0 && report.Failed > 0 {
+		aw.logger.Warn("addon 热更新未产生可用 addon，保留现有列表",
+			zap.Int("failed", report.Failed),
+		)
 		return
 	}
-	replace(addons)
-	logger.Info("addon 已热更新", zap.Int("count", len(addons)))
+
+	aw.replace(report.Addons)
+	aw.logger.Info("addon 已热更新",
+		zap.Int("count", len(report.Addons)),
+		zap.Int("failed", report.Failed),
+	)
 }
